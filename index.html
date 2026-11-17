@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Robotic Hand · Live Gesture Mirror</title>
 <style>
   :root { --ink:#1a1a1c; --mute:#77756f; --line:rgba(26,26,28,.14); --panel:rgba(255,255,255,.62); }
@@ -11,18 +11,20 @@
     font-family: "Helvetica Neue", Arial, sans-serif; }
   canvas#stage { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; }
 
-  .brand { position:fixed; left:28px; top:24px; pointer-events:none; }
+  .brand { position:fixed; left:calc(28px + env(safe-area-inset-left)); top:calc(24px + env(safe-area-inset-top)); pointer-events:none; }
   .brand b { display:block; font-size:12px; letter-spacing:.34em; font-weight:600; }
   .brand span { display:block; margin-top:6px; font-size:12px; color:var(--mute); letter-spacing:.08em; }
 
-  .tools { position:fixed; right:24px; top:20px; display:flex; gap:8px; }
+  .tools { position:fixed; right:calc(24px + env(safe-area-inset-right)); top:calc(20px + env(safe-area-inset-top)); display:flex; gap:8px; align-items:flex-start; }
+  .tool-items { display:flex; gap:8px; }
+  .ghost.icon { display:none; }
   .ghost { appearance:none; border:1px solid var(--line); background:var(--panel); color:var(--ink);
     font:inherit; font-size:12px; padding:8px 14px; border-radius:999px; cursor:pointer;
     backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); transition:background .15s; }
   .ghost:hover { background:#fff; }
   .ghost[aria-pressed="true"] { background:var(--ink); color:#fff; border-color:var(--ink); }
 
-  .dock { position:fixed; left:50%; bottom:28px; transform:translateX(-50%); display:flex; align-items:center; gap:14px;
+  .dock { position:fixed; left:50%; bottom:calc(28px + env(safe-area-inset-bottom)); transform:translateX(-50%); display:flex; align-items:center; gap:14px;
     padding:8px 18px 8px 8px; border-radius:999px; border:1px solid var(--line); background:var(--panel);
     backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); max-width:calc(100vw - 32px); }
   .primary { appearance:none; border:0; background:var(--ink); color:#fff; font:inherit; font-size:13px; font-weight:500;
@@ -38,7 +40,20 @@
     border:1px solid var(--line); background:#111; display:none; box-shadow:0 12px 30px rgba(0,0,0,.14); }
   .preview.on { display:block; }
   .preview video, .preview canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
-  @media (max-width:720px){ .preview{ width:132px; bottom:92px; right:14px; } .brand{ left:16px; top:16px; } .tools{ right:12px; top:12px; } }
+  @media (max-width:720px){ .preview{ width:132px; bottom:calc(96px + env(safe-area-inset-bottom)); right:14px; } .brand{ left:calc(16px + env(safe-area-inset-left)); top:calc(18px + env(safe-area-inset-top)); } .tools{ right:calc(12px + env(safe-area-inset-right)); top:calc(12px + env(safe-area-inset-top)); } }
+  /* compact layout for phones / narrow windows */
+  @media (max-width:600px){
+    .brand span{ display:none; }
+    .tools{ flex-direction:column; align-items:flex-end; }
+    .ghost.icon{ display:block; width:38px; height:38px; padding:0; font-size:18px; line-height:1; }
+    .tool-items{ display:none; flex-direction:column; align-items:stretch; gap:6px; }
+    .tools.open .tool-items{ display:flex; }
+    .tool-items .ghost{ background:rgba(255,255,255,.88); text-align:left; }
+    .dock{ gap:10px; padding:6px 14px 6px 6px; border-radius:26px; bottom:calc(16px + env(safe-area-inset-bottom)); width:calc(100vw - 24px); }
+    .primary{ padding:11px 16px; }
+    .status{ font-size:12px; line-height:1.35; }
+    .status span{ white-space:normal; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+  }
 </style>
 <script type="importmap">
 { "imports": {
@@ -52,10 +67,13 @@
 
 <div class="brand"><b>ROBOTIC HAND</b><span>Live gesture mirror · Drag to rotate / Scroll to zoom</span></div>
 
-<div class="tools">
+<div class="tools" id="tools">
+  <button class="ghost icon" id="btnMenu" aria-label="Menu" aria-expanded="false">&#8943;</button>
+  <div class="tool-items">
   <button class="ghost" id="btnFollow" aria-pressed="true" title="Move the robot hand around the screen with your hand">Follow position</button>
   <button class="ghost" id="btnFlip" title="Click if the palm and back of the hand appear swapped">Swap left / right</button>
   <button class="ghost" id="btnReset">Reset view</button>
+  </div>
 </div>
 
 <div class="preview" id="preview">
@@ -83,7 +101,10 @@ const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 /* ═════════════════════════ renderer / scene ═════════════════════════ */
 const canvas = document.getElementById('stage');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+/* quality: 0 = full (desktop), 1 = no AO + ≤1.5× pixels (phones / weak GPUs), 2 = 1× pixels + no shadows */
+const IS_MOBILE = (() => { const ua = navigator.userAgent || ''; return /Android|iPhone|iPad|iPod|Mobile/i.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1); })();
+let quality = IS_MOBILE ? 1 : 0;
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, quality === 0 ? 2 : 1.5));
 renderer.toneMapping = THREE.NeutralToneMapping;
 renderer.toneMappingExposure = 1.0;
 renderer.shadowMap.enabled = true;
@@ -142,7 +163,7 @@ controls.minDistance = 25; controls.maxDistance = 140;
 
 const key = new THREE.DirectionalLight(0xfffaf2, 1.35);
 key.castShadow = true;
-key.shadow.mapSize.set(2048, 2048);
+key.shadow.mapSize.set(quality === 0 ? 2048 : 1024, quality === 0 ? 2048 : 1024);
 Object.assign(key.shadow.camera, { left: -24, right: 24, top: 24, bottom: -24, near: 1, far: 140 });
 key.shadow.bias = -0.0002; key.shadow.normalBias = 0.035; key.shadow.radius = 6;
 scene.add(key, key.target);
@@ -150,7 +171,7 @@ const KEY_OFF = new V3(-22, 34, 30);
 
 /* post: ambient occlusion for depth in seams and crevices */
 let composer = null, gtao = null;
-try {
+if (quality === 0) try {
   const rt = new THREE.WebGLRenderTarget(4, 4, { type: THREE.HalfFloatType, samples: 4 });
   composer = new EffectComposer(renderer, rt);
   composer.addPass(new RenderPass(scene, camera));
@@ -565,7 +586,7 @@ async function startCamera() {
   try {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('nocam');
     setStatus('Requesting camera access…');
-    stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 960 }, height: { ideal: 720 }, facingMode: 'user' }, audio: false });
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: IS_MOBILE ? 640 : 960 }, height: { ideal: IS_MOBILE ? 480 : 720 }, facingMode: 'user' }, audio: false });
     video.srcObject = stream; await video.play();
     document.getElementById('preview').classList.add('on');
     if (!landmarker) {
@@ -623,6 +644,9 @@ function track(now) {
 }
 
 /* ═════════════════════════ UI ═════════════════════════ */
+const toolsEl = document.getElementById('tools'), btnMenu = document.getElementById('btnMenu');
+btnMenu.onclick = () => { const o = toolsEl.classList.toggle('open'); btnMenu.setAttribute('aria-expanded', o); };
+toolsEl.querySelectorAll('.tool-items .ghost').forEach(b => b.addEventListener('click', () => { toolsEl.classList.remove('open'); btnMenu.setAttribute('aria-expanded', false); }));
 const btnFollow = document.getElementById('btnFollow');
 btnFollow.onclick = () => { follow = !follow; btnFollow.setAttribute('aria-pressed', follow); };
 document.getElementById('btnFlip').onclick = () => { flipPrior *= -1; chirBelief *= -1; };
@@ -635,13 +659,35 @@ function resize() {
   camera.updateProjectionMatrix();
   if (composer) { composer.setPixelRatio(renderer.getPixelRatio()); composer.setSize(w, h); }
 }
-window.addEventListener('resize', resize); resize();
+window.addEventListener('resize', resize);
+function applyQuality() {
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, quality === 0 ? 2 : quality === 1 ? 1.5 : 1));
+  if (quality >= 1 && composer) { try { composer.dispose(); } catch {} composer = null; gtao = null; }
+  const sm = quality === 0 ? 2048 : 1024;
+  if (key.shadow.mapSize.x !== sm) { key.shadow.mapSize.set(sm, sm); if (key.shadow.map) { key.shadow.map.dispose(); key.shadow.map = null; } }
+  key.castShadow = quality < 2;
+  resize();
+}
+applyQuality();
+/* frame-rate guard: if the page runs below ~27 fps for two 2-second windows in a row, drop one quality level.
+   Never triggers on hardware that keeps up, and only ever steps down (no flip-flopping). */
+let fpsWarm = 0, fpsT = 0, fpsN = 0, slowWins = 0;
+function fpsGuard(raw) {
+  if (quality >= 2 || document.hidden || raw > 0.25) return;   // ignore background tabs and one-off stalls (model loading)
+  fpsWarm += raw; if (fpsWarm < 3) return;
+  fpsT += raw; fpsN++;
+  if (fpsT < 2) return;
+  const fps = fpsN / fpsT; fpsT = 0; fpsN = 0;
+  slowWins = fps < 27 ? slowWins + 1 : 0;
+  if (slowWins >= 2) { quality++; slowWins = 0; fpsWarm = 0; applyQuality(); }
+}
 
 /* ═════════════════════════ loop ═════════════════════════ */
 idlePose(0); apply(1, true);
 let prev = performance.now();
 function frame(now) {
-  const dt = Math.min(0.05, (now - prev) / 1000); prev = now;
+  const raw = (now - prev) / 1000, dt = Math.min(0.05, raw); prev = now;
+  fpsGuard(raw);
   track(now);
   const tracking = now - lastSeen < 450;
   if (!tracking) idlePose(now / 1000);
@@ -652,7 +698,7 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-window.__hand = { THREE, scene, camera, controls, renderer, gtao, M, key, target, setFake: v => { fake = v; } };
+window.__hand = { THREE, scene, camera, controls, renderer, M, key, target, setFake: v => { fake = v; }, get quality() { return quality; }, get post() { return !!composer; } };
 </script>
 </body>
 </html>
