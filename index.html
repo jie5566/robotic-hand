@@ -159,7 +159,7 @@ const CAM_HOME = new V3(0, 0, 52);
 camera.position.copy(CAM_HOME);
 const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true; controls.enablePan = false;
-controls.minDistance = 25; controls.maxDistance = 140;
+controls.minDistance = 25; controls.maxDistance = 280;
 
 const key = new THREE.DirectionalLight(0xfffaf2, 1.35);
 key.castShadow = true;
@@ -471,7 +471,7 @@ function idlePose(t) {
   target.chir = -1; rootQuat(target.quat, fr.X, fr.Y, fr.Z0, -1);
   const sway = new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.sin(t * 0.5) * 0.03, Math.sin(t * 0.37) * 0.05, Math.sin(t * 0.43) * 0.02));
   target.quat.premultiply(sway);
-  target.pos.set(3.5, 2.2 + Math.sin(t * 0.8) * 0.25, 0); target.scale = 1;
+  target.pos.set(3.5 * Math.min(1, camera.aspect), 2.2 + Math.sin(t * 0.8) * 0.25, 0); target.scale = 1;
   IDLE.f.forEach((a, i) => {
     const w = Math.sin(t * 1.1 - i * 0.55) * 0.07;
     Object.assign(target.f[i], { flex: a[0] + w, abd: a[1], pip: a[2] + w * 1.4, dip: a[3] + w });
@@ -655,7 +655,15 @@ document.getElementById('btnReset').onclick = () => { camera.position.copy(CAM_H
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
   renderer.setSize(w, h, false); camera.aspect = w / h;
-  camera.fov = w / h < 1 ? 28 + (1 - w / h) * 14 : 28;
+  // keep ~40 units of the scene visible across the screen: on portrait phones pull the camera back
+  // instead of widening the lens, so the whole hand fits without fish-eye distortion
+  camera.fov = 28;
+  const dist = Math.max(52, 40 / (2 * Math.tan(14 * PI / 180) * camera.aspect));
+  if (Math.abs(dist - CAM_HOME.z) > 0.01) {
+    const d = camera.position.clone().sub(controls.target);
+    d.setLength(d.length() * dist / CAM_HOME.z); camera.position.copy(controls.target).add(d);
+    CAM_HOME.z = dist;
+  }
   camera.updateProjectionMatrix();
   if (composer) { composer.setPixelRatio(renderer.getPixelRatio()); composer.setSize(w, h); }
 }
