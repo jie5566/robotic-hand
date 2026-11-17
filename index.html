@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robotic Hand · Live Gesture Mirror</title>
+<style>
+  :root { --ink:#1a1a1c; --mute:#77756f; --line:rgba(26,26,28,.14); --panel:rgba(255,255,255,.62); }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; overflow:hidden; color:var(--ink); background:#e9e8e4;
+    font-family: "Helvetica Neue", Arial, sans-serif; }
+  canvas#stage { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; }
+
+  .brand { position:fixed; left:28px; top:24px; pointer-events:none; }
+  .brand b { display:block; font-size:12px; letter-spacing:.34em; font-weight:600; }
+  .brand span { display:block; margin-top:6px; font-size:12px; color:var(--mute); letter-spacing:.08em; }
+
+  .tools { position:fixed; right:24px; top:20px; display:flex; gap:8px; }
+  .ghost { appearance:none; border:1px solid var(--line); background:var(--panel); color:var(--ink);
+    font:inherit; font-size:12px; padding:8px 14px; border-radius:999px; cursor:pointer;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); transition:background .15s; }
+  .ghost:hover { background:#fff; }
+  .ghost[aria-pressed="true"] { background:var(--ink); color:#fff; border-color:var(--ink); }
+
+  .dock { position:fixed; left:50%; bottom:28px; transform:translateX(-50%); display:flex; align-items:center; gap:14px;
+    padding:8px 18px 8px 8px; border-radius:999px; border:1px solid var(--line); background:var(--panel);
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); max-width:calc(100vw - 32px); }
+  .primary { appearance:none; border:0; background:var(--ink); color:#fff; font:inherit; font-size:13px; font-weight:500;
+    padding:11px 20px; border-radius:999px; cursor:pointer; white-space:nowrap; }
+  .primary:disabled { opacity:.55; cursor:default; }
+  .status { font-size:12.5px; color:var(--mute); display:flex; align-items:center; gap:8px; min-width:0; }
+  .status i { width:7px; height:7px; border-radius:50%; background:#b5b3ad; flex:none; }
+  .status.live i { background:#2fae62; box-shadow:0 0 0 4px rgba(47,174,98,.18); }
+  .status.warn i { background:#d9822b; }
+  .status span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  .preview { position:fixed; right:24px; bottom:28px; width:220px; aspect-ratio:4/3; border-radius:14px; overflow:hidden;
+    border:1px solid var(--line); background:#111; display:none; box-shadow:0 12px 30px rgba(0,0,0,.14); }
+  .preview.on { display:block; }
+  .preview video, .preview canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+  @media (max-width:720px){ .preview{ width:132px; bottom:92px; right:14px; } .brand{ left:16px; top:16px; } .tools{ right:12px; top:12px; } }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<div class="brand"><b>ROBOTIC HAND</b><span>Live gesture mirror · Drag to rotate / Scroll to zoom</span></div>
+
+<div class="tools">
+  <button class="ghost" id="btnFollow" aria-pressed="true" title="Move the robot hand around the screen with your hand">Follow position</button>
+  <button class="ghost" id="btnFlip" title="Click if the palm and back of the hand appear swapped">Swap left / right</button>
+  <button class="ghost" id="btnReset">Reset view</button>
+</div>
+
+<div class="preview" id="preview">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div class="dock">
+  <button class="primary" id="btnCam">Start camera</button>
+  <div class="status" id="status"><i></i><span id="statusText">Demo mode · Start the camera and the robot hand will follow yours</span></div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+const V3 = THREE.Vector3, PI = Math.PI;
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+/* ═════════════════════════ renderer / scene ═════════════════════════ */
+const canvas = document.getElementById('stage');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xe9e8e4);
+
+/* Studio environment: soft-edged HDR softboxes + black flags, so lacquer gets broad soft highlights
+   and black chrome gets crisp bright streaks against dark reflections. */
+function softTex() {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, 256, 256);
+  g.shadowColor = '#fff'; g.shadowBlur = 46; g.fillStyle = '#fff';
+  g.beginPath(); g.roundRect ? g.roundRect(46, 46, 164, 164, 30) : g.rect(46, 46, 164, 164); g.fill();
+  return new THREE.CanvasTexture(c);
+}
+const SOFT = softTex();
+function buildEnv() {
+  const s = new THREE.Scene();
+  const geo = new THREE.SphereGeometry(80, 64, 32), p = geo.attributes.position, col = [];
+  for (let i = 0; i < p.count; i++) {
+    const y = p.getY(i) / 80;
+    const v = y > 0 ? 0.78 + y * 0.22 : 0.78 + y * 0.55;
+    col.push(v, v * 0.995, v * 0.98);
+  }
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  s.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide })));
+  const box = (w, h, x, y, z, I, soft = true) => {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
+      new THREE.MeshBasicMaterial({ color: new THREE.Color(I, I, I), map: soft ? SOFT : null, side: THREE.DoubleSide }));
+    m.position.set(x, y, z); m.lookAt(0, 0, 0); s.add(m);
+  };
+  box(46, 34, -34, 40, 30, 14);    // large key softbox, upper-left front
+  box(70, 40, 0, 60, 0, 6);        // overhead scrim
+  box(12, 60, 52, 6, 18, 11);      // tall strip, right
+  box(12, 50, -50, -4, -26, 8);    // tall strip, back left (rim)
+  box(40, 14, 10, 24, -55, 9);     // back top rim
+  box(60, 10, 0, -14, 58, 3);      // low front bounce
+  box(30, 46, -60, 2, 24, 0.02, false);  // black flags
+  box(26, 40, 58, -8, -34, 0.02, false);
+  box(50, 20, 0, -40, 30, 0.05, false);
+  const pm = new THREE.PMREMGenerator(renderer);
+  const t = pm.fromScene(s, 0).texture; pm.dispose(); return t;
+}
+scene.environment = buildEnv();
+scene.environmentIntensity = 0.62;
+
+const camera = new THREE.PerspectiveCamera(28, 1, 1, 400);
+const CAM_HOME = new V3(0, 0, 52);
+camera.position.copy(CAM_HOME);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true; controls.enablePan = false;
+controls.minDistance = 25; controls.maxDistance = 140;
+
+const key = new THREE.DirectionalLight(0xfffaf2, 1.35);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+Object.assign(key.shadow.camera, { left: -24, right: 24, top: 24, bottom: -24, near: 1, far: 140 });
+key.shadow.bias = -0.0002; key.shadow.normalBias = 0.035; key.shadow.radius = 6;
+scene.add(key, key.target);
+const KEY_OFF = new V3(-22, 34, 30);
+
+/* post: ambient occlusion for depth in seams and crevices */
+let composer = null, gtao = null;
+try {
+  const rt = new THREE.WebGLRenderTarget(4, 4, { type: THREE.HalfFloatType, samples: 4 });
+  composer = new EffectComposer(renderer, rt);
+  composer.addPass(new RenderPass(scene, camera));
+  gtao = new GTAOPass(scene, camera, 4, 4);
+  gtao.updateGtaoMaterial({ radius: 1.6, distanceExponent: 1.4, thickness: 1.2, scale: 1.15, samples: 16, distanceFallOff: 1 });
+  gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 5, rings: 2, samples: 16 });
+  gtao.blendIntensity = 0.85;
+  composer.addPass(gtao);
+  composer.addPass(new OutputPass());
+} catch (e) { console.warn('post disabled', e); composer = null; }
+
+/* ═════════════════════════ textures & materials ═════════════════════════ */
+function canvasTex(size, draw, srgb) {
+  const c = document.createElement('canvas'); c.width = c.height = size;
+  draw(c.getContext('2d'), size);
+  const t = new THREE.CanvasTexture(c);
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 8;
+  return t;
+}
+const rnd = Math.random;
+function blobs(g, S, n, rgba, rMin, rMax) {
+  for (let i = 0; i < n; i++) {
+    const x = rnd() * S, y = rnd() * S, r = rMin + rnd() * (rMax - rMin);
+    const gr = g.createRadialGradient(x, y, 0, x, y, r);
+    gr.addColorStop(0, rgba); gr.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = gr; g.fillRect(x - r, y - r, r * 2, r * 2);
+  }
+}
+function specks(g, S, n, a, rMax) {
+  for (let i = 0; i < n; i++) {
+    g.fillStyle = 'rgba(38,32,26,' + (rnd() * a).toFixed(3) + ')';
+    g.beginPath(); g.arc(rnd() * S, rnd() * S, 0.35 + rnd() * rMax, 0, 6.3); g.fill();
+  }
+}
+const paintMap = canvasTex(1024, (g, S) => {
+  g.fillStyle = '#fff'; g.fillRect(0, 0, S, S);
+  blobs(g, S, 40, 'rgba(120,104,84,0.07)', 30, 140);
+  specks(g, S, 3800, 0.2, 1.1);
+}, true);
+const padMap = canvasTex(512, (g, S) => {
+  g.fillStyle = '#fff'; g.fillRect(0, 0, S, S);
+  blobs(g, S, 20, 'rgba(255,255,255,0.18)', 20, 90);
+  specks(g, S, 1400, 0.35, 1.0);
+}, true);
+const roughMap = canvasTex(512, (g, S) => {
+  g.fillStyle = 'rgb(238,238,238)'; g.fillRect(0, 0, S, S);
+  blobs(g, S, 50, 'rgba(255,255,255,0.35)', 20, 90);
+  blobs(g, S, 50, 'rgba(160,160,160,0.25)', 20, 90);
+}, false);
+const grain = canvasTex(512, (g, S) => {
+  const id = g.createImageData(S, S);
+  for (let i = 0; i < S * S; i++) { const v = 112 + rnd() * 32; id.data[i * 4] = id.data[i * 4 + 1] = id.data[i * 4 + 2] = v; id.data[i * 4 + 3] = 255; }
+  g.putImageData(id, 0, 0);
+}, false);
+grain.repeat.set(3, 3);
+
+const M = {
+  // satin off-white paint under a clear lacquer coat
+  paint: new THREE.MeshPhysicalMaterial({ color: 0xefece5, map: paintMap, roughness: 0.38, roughnessMap: roughMap,
+    bumpMap: grain, bumpScale: 0.45, clearcoat: 1, clearcoatRoughness: 0.09 }),
+  // smoky grey pads (palm side)
+  pad: new THREE.MeshPhysicalMaterial({ color: 0x55524e, map: padMap, roughness: 0.46, roughnessMap: roughMap,
+    bumpMap: grain, bumpScale: 0.45, clearcoat: 0.85, clearcoatRoughness: 0.16 }),
+  // glossy black chrome
+  chrome: new THREE.MeshPhysicalMaterial({ color: 0x4b4b50, metalness: 1, roughness: 0.075, clearcoat: 1, clearcoatRoughness: 0.025 }),
+  steel: new THREE.MeshPhysicalMaterial({ color: 0xcdcdd2, metalness: 1, roughness: 0.17 }),
+  dark: new THREE.MeshStandardMaterial({ color: 0x131315, roughness: 0.55, metalness: 0.3 }),
+  gun: new THREE.MeshPhysicalMaterial({ color: 0x8c8c92, metalness: 1, roughness: 0.26, roughnessMap: roughMap, clearcoat: 0.25, clearcoatRoughness: 0.2 }),
+  rubber: new THREE.MeshPhysicalMaterial({ color: 0x1a1a1c, roughness: 0.42, clearcoat: 0.6, clearcoatRoughness: 0.2 }),
+};
+
+/* ═════════════════════════ geometry helpers ═════════════════════════ */
+/** smooth rounded "pod" along +Y: superellipse cross-section (n=2 ellipse … n→∞ box), rounded ends.
+    w/d taper from w0,d0 to w1,d1; zc(t) bends the centreline in Z. */
+function pod({ len, w0, w1 = w0, d0, d1 = d0, n = 3, c0 = 0.3, c1 = 0.3, rs = 48, ls = 40, zc = null }) {
+  const pos = [], uv = [], idx = [];
+  for (let i = 0; i <= ls; i++) {
+    const u = i / ls, s = len * (0.5 - 0.5 * Math.cos(PI * u));
+    let e = 1;
+    if (s < c0) { const q = 1 - s / c0; e = Math.sqrt(Math.max(0, 1 - q * q)); }
+    else if (s > len - c1) { const q = (s - (len - c1)) / c1; e = Math.sqrt(Math.max(0, 1 - q * q)); }
+    e = Math.max(e, 0.0001);
+    const t = s / len, a = (w0 + (w1 - w0) * t) / 2 * e, b = (d0 + (d1 - d0) * t) / 2 * e, z0 = zc ? zc(t) : 0;
+    for (let j = 0; j < rs; j++) {
+      const th = j / rs * PI * 2, c = Math.cos(th), sn = Math.sin(th);
+      pos.push(a * Math.sign(c) * Math.pow(Math.abs(c), 2 / n), s, b * Math.sign(sn) * Math.pow(Math.abs(sn), 2 / n) + z0);
+      uv.push(Math.abs(j / rs * 2 - 1) * (w0 + w1) * 0.1, t * len * 0.1);
+    }
+  }
+  for (let i = 0; i < ls; i++) for (let j = 0; j < rs; j++) {
+    const a = i * rs + j, b = i * rs + (j + 1) % rs, c = a + rs, d = b + rs;
+    idx.push(a, c, b, b, c, d);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx); g.computeVertexNormals();
+  return g;
+}
+function mesh(geo, mat, p = [0, 0, 0], r = null) { const m = new THREE.Mesh(geo, mat); m.position.set(p[0], p[1], p[2]); if (r) m.rotation.set(r[0], r[1], r[2]); return m; }
+function rbox(w, h, d, r, mat) { return new THREE.Mesh(new RoundedBoxGeometry(w, h, d, 6, Math.min(r, w / 2.05, h / 2.05, d / 2.05)), mat); }
+function rod(a, b, r, mat) {
+  const d = b.clone().sub(a), m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, d.length(), 20), mat);
+  m.position.copy(a).addScaledVector(d, 0.5); m.quaternion.setFromUnitVectors(new V3(0, 1, 0), d.normalize()); return m;
+}
+/** turned joint cap: concentric grooves + rolled rim, axis +Y, base at y=0 */
+function capGeo(r, h) {
+  const P = [[0, 1], [0.18, 1], [0.22, 0.8], [0.34, 0.8], [0.38, 0.96], [0.6, 0.96], [0.64, 0.74], [0.72, 0.74], [0.77, 0.98],
+    [0.9, 0.94], [0.97, 0.78], [1, 0.5], [0.99, 0.2], [0.95, 0]];
+  return new THREE.LatheGeometry(P.map(([a, b]) => new THREE.Vector2(a * r, b * h)), 56);
+}
+/** glossy hinge along X with turned caps both sides */
+function hinge(w, r) {
+  const g = new THREE.Group();
+  g.add(mesh(new THREE.CylinderGeometry(r, r, w * 0.88, 48), M.chrome, [0, 0, 0], [0, 0, PI / 2]));
+  const h = w * 0.1;
+  for (const s of [-1, 1]) {
+    g.add(mesh(capGeo(r * 1.04, h), M.chrome, [s * w * 0.43, 0, 0], [0, 0, -s * PI / 2]));
+    g.add(mesh(new THREE.TorusGeometry(r * 0.49, r * 0.035, 8, 48), M.steel, [s * (w * 0.43 + h * 0.97), 0, 0], [0, PI / 2, 0]));
+  }
+  return g;
+}
+const GEARS = [];
+/** involute-ish spur gear outline by module m and tooth count N (pitch radius = m·N/2) */
+function gearShape(m, N) {
+  const rp = m * N / 2, ro = rp + m * 0.9, rr = rp - m * 1.15, da = PI * 2 / N;
+  const s = new THREE.Shape();
+  for (let i = 0; i < N; i++) {
+    const a0 = i * da;   // tooth i is centred at a0 + 0.41·da
+    [[rr, a0], [rr, a0 + da * 0.12], [rp, a0 + da * 0.22], [ro, a0 + da * 0.3], [ro, a0 + da * 0.52], [rp, a0 + da * 0.6], [rr, a0 + da * 0.7]].forEach(([rad, a], k) => {
+      const x = Math.cos(a) * rad, y = Math.sin(a) * rad; if (i === 0 && k === 0) s.moveTo(x, y); else s.lineTo(x, y);
+    });
+  }
+  s.closePath();
+  const hole = (cx, cy, hr) => { const p = new THREE.Path(); p.absarc(cx, cy, hr, 0, PI * 2, true); s.holes.push(p); };
+  hole(0, 0, rr * 0.2);
+  if (N >= 12) for (let i = 0; i < 5; i++) { const a = i / 5 * PI * 2 + 0.3; hole(Math.cos(a) * rr * 0.6, Math.sin(a) * rr * 0.6, rr * 0.17); }
+  else for (let i = 0; i < 4; i++) { const a = i / 4 * PI * 2 + 0.4; hole(Math.cos(a) * rr * 0.6, Math.sin(a) * rr * 0.6, rr * 0.15); }
+  return s;
+}
+/** machined spur gear, axis = Z. phase: angle the first tooth centre is turned to; k: gear ratio sign/size for driving */
+function gear(m, N, th, phase, k) {
+  const rp = m * N / 2, rr = rp - m * 1.15;
+  const g = new THREE.Group(), spin = new THREE.Group(); g.add(spin);
+  const geo = new THREE.ExtrudeGeometry(gearShape(m, N), { depth: th, bevelEnabled: true, bevelThickness: th * 0.12, bevelSize: m * 0.12, bevelSegments: 3, curveSegments: 24 });
+  geo.translate(0, 0, -th / 2);
+  spin.add(new THREE.Mesh(geo, M.gun));
+  spin.add(mesh(new THREE.CylinderGeometry(rr * 0.34, rr * 0.38, th * 1.7, 40), M.chrome, [0, 0, 0], [PI / 2, 0, 0]));
+  spin.add(mesh(new THREE.CylinderGeometry(rr * 0.19, rr * 0.19, th * 2.3, 6), M.steel, [0, 0, 0], [PI / 2, 0, 0]));
+  spin.add(mesh(new THREE.TorusGeometry(rr * 0.9, m * 0.1, 8, 64), M.steel, [0, 0, th * 0.62]));
+  spin.add(mesh(new THREE.TorusGeometry(rr * 0.9, m * 0.1, 8, 64), M.steel, [0, 0, -th * 0.62]));
+  spin.rotation.z = phase; spin.userData.k = k;
+  GEARS.push(spin);
+  return g;
+}
+/** a meshed pair on the wrist side s: big driver + small driven gear in the same plane (axis = world X) */
+function gearPair(s) {
+  const m = 0.14, N1 = 16, N2 = 11, rp1 = m * N1 / 2, rp2 = m * N2 / 2, back = 0.015;
+  const c1 = new V3(s * 2.15, -1.0, 0.1), d = new V3(0, -0.75, -0.66).normalize();
+  const c2 = c1.clone().addScaledVector(d, rp1 + rp2 + back);
+  // rotation.y = +90° maps gear-local (x, y) → world (−z, y): direction to the partner in local angles
+  const phi1 = Math.atan2(d.y, -d.z), phi2 = phi1 + PI;
+  const da1 = PI * 2 / N1, da2 = PI * 2 / N2;
+  const g1 = gear(m, N1, 0.42, phi1 - 0.41 * da1, 1);             // tooth centred on the line of centres
+  const g2 = gear(m, N2, 0.42, phi2 - 0.91 * da2, -N1 / N2);      // gap centred on it → teeth interleave
+  for (const [g, c] of [[g1, c1], [g2, c2]]) { g.rotation.y = PI / 2; g.position.copy(c); hand.add(g); }
+  hand.add(rod(new V3(s * 1.7, c2.y, c2.z), new V3(s * 2.15, c2.y, c2.z), 0.12, M.steel));   // axle of the small gear
+}
+function segment({ len, w, t, tip = false, plate = true, showHinge = true }) {
+  const g = new THREE.Group(), r = t * 0.38;
+  if (showHinge) g.add(hinge(w, r));
+  const y0 = r * 0.8, y1 = tip ? len : len - r * 0.8, L = y1 - y0;
+  g.add(mesh(new RoundedBoxGeometry(w * 0.66, L + r * 0.6, t * 0.56, 4, 0.2), M.dark, [0, y0 + L / 2 - r * 0.25, 0]));
+  if (!tip) {
+    g.add(mesh(pod({ len: L, w0: w, w1: w * 0.95, d0: t * 0.8, d1: t * 0.76, n: 3.6, c0: t * 0.22, c1: t * 0.22 }), M.paint, [0, y0, -t * 0.14]));
+    g.add(mesh(pod({ len: L * 0.94, w0: w * 0.87, w1: w * 0.83, d0: t * 0.62, d1: t * 0.6, n: 3, c0: t * 0.2, c1: t * 0.2 }), M.pad, [0, y0 + L * 0.03, t * 0.17]));
+    if (plate) g.add(mesh(pod({ len: L * 0.5, w0: w * 0.6, w1: w * 0.5, d0: t * 0.2, n: 5, c0: t * 0.1, c1: t * 0.1, ls: 20 }), M.paint, [0, y0 + L * 0.36, -t * 0.53]));
+  } else {
+    const bend = u => t * 0.1 * u * u;
+    g.add(mesh(pod({ len: L * 0.74, w0: w, w1: w * 0.84, d0: t * 0.8, d1: t * 0.6, n: 3.4, c0: t * 0.22, c1: t * 0.45, zc: bend }), M.paint, [0, y0, -t * 0.14]));
+    g.add(mesh(pod({ len: L, w0: w * 0.9, w1: w * 0.76, d0: t * 0.66, d1: t * 0.56, n: 2.6, c0: t * 0.3, c1: t * 0.55, zc: u => t * 0.14 * u * u }), M.pad, [0, y0, t * 0.13]));
+    g.add(mesh(pod({ len: L * 0.3, w0: w * 0.55, w1: w * 0.45, d0: t * 0.14, n: 4, c0: t * 0.08, c1: t * 0.12, ls: 16 }), M.pad, [0, y0 + L * 0.66, -t * 0.43], [-0.25, 0, 0]));
+  }
+  return g;
+}
+
+/* ═════════════════════════ build the hand (right hand: +X thumb side, +Y fingers, +Z palm) ═════════════════════════ */
+const root = new THREE.Group(); scene.add(root);                         // origin ≈ palm centre
+const hand = new THREE.Group(); hand.position.y = -5.4; root.add(hand);  // origin = wrist
+
+// palm
+{
+  hand.add(mesh(pod({ len: 8.9, w0: 7.0, w1: 8.9, d0: 2.6, d1: 2.4, n: 4.4, c0: 1.0, c1: 0.8 }), M.paint, [0, 0.3, -0.5]));
+  hand.add(mesh(pod({ len: 8.6, w0: 6.5, w1: 8.5, d0: 2.5, d1: 2.3, n: 3.6, c0: 1.0, c1: 0.8 }), M.pad, [0, 0.4, 0.5]));
+  hand.add(mesh(pod({ len: 6.0, w0: 5.0, w1: 6.3, d0: 0.8, n: 6, c0: 0.5, c1: 0.5, ls: 24 }), M.paint, [-0.1, 1.9, -1.72]));
+  hand.add(mesh(pod({ len: 4.2, w0: 3.0, w1: 2.4, d0: 1.6, n: 2.6, c0: 1.0, c1: 1.0 }), M.pad, [2.0, 1.0, 1.35], [0, 0, -0.38]));
+  for (let i = 0; i < 4; i++) hand.add(mesh(new RoundedBoxGeometry(1.25, 0.14, 0.12, 2, 0.05), M.dark, [1.3, 5.6 + i * 0.32, -2.14]));
+  for (const [x, y] of [[-2.1, 2.5], [1.8, 2.5], [2.5, 7.0], [-2.5, 7.0]]) hand.add(mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.12, 6), M.steel, [x, y, -2.12], [PI / 2, 0, 0]));
+  hand.add(mesh(new RoundedBoxGeometry(4.0, 0.05, 0.05, 2, 0.02), M.dark, [-0.6, 4.4, -2.13], [0, 0, 0.45]));
+}
+
+// fingers
+const FINGERS = [
+  { name: 'index',  x: 3.2,   y: 9.25, L: [4.3, 2.7, 2.5],  w: 1.9,  t: 1.85 },
+  { name: 'middle', x: 1.07,  y: 9.7,  L: [4.7, 3.0, 2.6],  w: 1.95, t: 1.9 },
+  { name: 'ring',   x: -1.06, y: 9.3,  L: [4.35, 2.8, 2.5], w: 1.88, t: 1.82 },
+  { name: 'pinky',  x: -3.12, y: 8.35, L: [3.5, 2.2, 2.2],  w: 1.68, t: 1.62 },
+];
+const fingers = FINGERS.map(f => {
+  hand.add(mesh(new RoundedBoxGeometry(f.w * 1.04, 1.7, f.t * 1.12, 6, 0.5), M.chrome, [f.x, f.y - 0.95, -0.15]));
+  const mcp = new THREE.Group(); mcp.position.set(f.x, f.y, 0); mcp.rotation.order = 'XYZ'; hand.add(mcp);
+  mcp.add(segment({ len: f.L[0], w: f.w, t: f.t }));
+  const pip = new THREE.Group(); pip.position.y = f.L[0]; mcp.add(pip);
+  pip.add(segment({ len: f.L[1], w: f.w * 0.94, t: f.t * 0.94, plate: false }));
+  const dip = new THREE.Group(); dip.position.y = f.L[1]; pip.add(dip);
+  dip.add(segment({ len: f.L[2], w: f.w * 0.88, t: f.t * 0.88, tip: true }));
+  return { mcp, pip, dip };
+});
+
+// thumb
+const thumb = (() => {
+  const base = new THREE.Group(); base.position.set(2.75, 2.1, 0.55); hand.add(base);
+  base.add(mesh(new THREE.SphereGeometry(1.3, 48, 32), M.chrome));
+  base.add(segment({ len: 4.0, w: 2.2, t: 2.05, showHinge: false }));
+  const mcp = new THREE.Group(); mcp.position.y = 4.0; base.add(mcp);
+  mcp.add(segment({ len: 3.2, w: 2.05, t: 1.95, plate: false }));
+  for (let i = 0; i < 3; i++) mcp.add(mesh(new THREE.TorusGeometry(0.95, 0.1, 12, 40), M.chrome, [0, 0.62 + i * 0.24, 0], [PI / 2, 0, 0]));
+  const ip = new THREE.Group(); ip.position.y = 3.2; mcp.add(ip);
+  ip.add(segment({ len: 3.0, w: 1.9, t: 1.8, tip: true }));
+  return { base, mcp, ip };
+})();
+
+// wrist mechanics
+{
+  hand.add(mesh(new THREE.SphereGeometry(1.6, 48, 32), M.chrome, [0, -0.9, 0]));
+  const cup = mesh(new THREE.CylinderGeometry(2.6, 2.2, 0.9, 48), M.chrome, [0, 0.25, 0]); cup.scale.z = 0.62; hand.add(cup);
+  const coll = mesh(new THREE.TorusGeometry(1.8, 0.2, 14, 56), M.steel, [0, -0.2, 0], [PI / 2, 0, 0]); coll.scale.y = 0.7; hand.add(coll);
+  for (const s of [-1, 1]) {
+    gearPair(s);
+    hand.add(rod(new V3(s * 1.5, -3.6, 0.55), new V3(s * 1.75, 0.5, 0.5), 0.13, M.steel));
+    hand.add(rod(new V3(s * 1.5, -3.6, 0.55), new V3(s * 1.62, -1.6, 0.52), 0.26, M.chrome));
+    hand.add(rod(new V3(s * 0.9, -3.6, -0.95), new V3(s * 1.25, 0.5, -0.8), 0.11, M.steel));
+  }
+  for (const [x, z, k] of [[-2.5, -1.3, 1], [2.4, -1.2, -1], [-0.8, 1.9, 1], [0.9, 1.8, 1], [0.1, -1.9, -1]]) {
+    const c = new THREE.CatmullRomCurve3([new V3(x * 0.8, -4.2, z * 0.6), new V3(x * 1.05, -2.6, z * 0.95), new V3(x * 0.95 + k * 0.2, -1.0, z * 0.9), new V3(x * 0.8, 0.6, z * 0.5)]);
+    hand.add(new THREE.Mesh(new THREE.TubeGeometry(c, 32, 0.14, 10), M.rubber));
+  }
+  const neck = mesh(new THREE.CylinderGeometry(2.55, 2.75, 1.8, 56), M.chrome, [0, -4.3, 0]); neck.scale.z = 0.74; hand.add(neck);
+}
+
+// forearm (built along +Y, flipped to point down)
+{
+  const fa = new THREE.Group(); fa.position.set(0, -4.2, 0); fa.rotation.z = PI; hand.add(fa);
+  const FL = 25;
+  fa.add(mesh(pod({ len: FL, w0: 5.5, w1: 7.4, d0: 3.6, d1: 4.6, n: 3.4, c0: 0.9, c1: 2.0 }), M.paint, [0, 0, -0.4]));
+  fa.add(mesh(pod({ len: FL - 0.5, w0: 5.0, w1: 6.8, d0: 3.3, d1: 4.3, n: 3, c0: 0.9, c1: 1.8 }), M.pad, [0, 0.25, 0.55]));
+  fa.add(mesh(pod({ len: 8.5, w0: 3.1, w1: 3.6, d0: 0.7, n: 6, c0: 0.4, c1: 0.4, ls: 24 }), M.paint, [0.4, 2.6, -2.22]));
+  for (let i = 0; i < 3; i++) fa.add(mesh(new RoundedBoxGeometry(0.15, 1.4, 0.12, 2, 0.05), M.dark, [-1.7 + i * 0.36, 4.2, -2.3]));
+}
+root.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+
+/* ═════════════════════════ pose state ═════════════════════════ */
+const mkPose = () => ({
+  pos: new V3(), scale: 1, chir: -1, quat: new THREE.Quaternion(),
+  f: [0, 1, 2, 3].map(() => ({ flex: 0, abd: 0, pip: 0, dip: 0 })),
+  tq: new THREE.Quaternion(), tmcp: 0, tip: 0,
+});
+const target = mkPose(), cur = mkPose();
+
+const _x = new V3(), _y = new V3(), _z = new V3(), _m = new THREE.Matrix4();
+/** palm frame from "pinky→index" (xr) and "wrist→middle knuckle" (y) directions */
+function palmFrame(xr, y) {
+  _y.copy(y).normalize(); _z.crossVectors(xr, _y).normalize(); _x.crossVectors(_y, _z).normalize();
+  return { X: _x, Y: _y, Z0: _z };
+}
+function rootQuat(out, X, Y, Z0, chir) {
+  const a = X.clone().multiplyScalar(chir), c = Z0.clone().multiplyScalar(chir);
+  return out.setFromRotationMatrix(_m.makeBasis(a, Y, c));
+}
+const THUMB_FLEX_DIR = new V3(-0.6, 0.0, 0.8).normalize();
+function thumbQuat(out, dir, hingeHint) {
+  const y = dir.clone().normalize();
+  const h = hingeHint ? hingeHint.clone() : new V3().crossVectors(y, THUMB_FLEX_DIR);
+  h.addScaledVector(y, -h.dot(y)).normalize();
+  const z = new V3().crossVectors(h, y);
+  return out.setFromRotationMatrix(_m.makeBasis(h, y, z));
+}
+
+// idle pose ≈ the reference photo: arm from lower left, fingers reaching right, progressively curled
+const IDLE = { Y: new V3(0.84, 0.54, 0.0), back: new V3(-0.6, 0.74, 0.25),
+  f: [[0.12, -0.05, 0.28, 0.26], [0.42, 0.0, 0.62, 0.42], [0.6, 0.05, 0.8, 0.5], [0.72, 0.11, 0.86, 0.5]],
+  thumbDir: new V3(0.6, 0.66, 0.45), tmcp: 0.3, tip: 0.42 };
+function idlePose(t) {
+  const X = new V3().crossVectors(IDLE.Y, IDLE.back);
+  const fr = palmFrame(X, IDLE.Y);
+  target.chir = -1; rootQuat(target.quat, fr.X, fr.Y, fr.Z0, -1);
+  const sway = new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.sin(t * 0.5) * 0.03, Math.sin(t * 0.37) * 0.05, Math.sin(t * 0.43) * 0.02));
+  target.quat.premultiply(sway);
+  target.pos.set(3.5, 2.2 + Math.sin(t * 0.8) * 0.25, 0); target.scale = 1;
+  IDLE.f.forEach((a, i) => {
+    const w = Math.sin(t * 1.1 - i * 0.55) * 0.07;
+    Object.assign(target.f[i], { flex: a[0] + w, abd: a[1], pip: a[2] + w * 1.4, dip: a[3] + w });
+  });
+  thumbQuat(target.tq, IDLE.thumbDir); target.tmcp = IDLE.tmcp + Math.sin(t * 0.9) * 0.05; target.tip = IDLE.tip + Math.sin(t * 0.9 + 0.5) * 0.06;
+}
+
+/* ═════════════════════════ landmarks → pose ═════════════════════════ */
+let flipPrior = 1, chirBelief = -1, follow = true;
+const signedAngle = (a, b, axis) => Math.atan2(new V3().crossVectors(a, b).dot(axis), a.dot(b));
+
+function solve(world, image, label, vAspect) {
+  // mirror like a mirror: scene = −(mediapipe world) → x flipped, y up, z toward viewer
+  const P = world.map(p => new V3(-p.x, -p.y, -p.z));
+  const fr = palmFrame(P[5].clone().sub(P[17]), P[9].clone().sub(P[0]));
+  const X = fr.X.clone(), Y = fr.Y.clone(), Z0 = fr.Z0.clone();
+
+  // chirality: fingers can only curl toward the palm; fall back on the model's label for a flat hand
+  let e = 0;
+  for (const [a, b] of [[5, 8], [9, 12], [13, 16], [17, 20]]) e += P[b].clone().sub(P[a]).normalize().dot(Z0);
+  e = e / 4 + 0.35 * P[2].clone().sub(P[1]).normalize().dot(Z0);
+  if (Math.abs(e) < 0.18) e = 0;
+  const prior = (label === 'Left' ? -1 : 1) * flipPrior;
+  chirBelief += (clamp(prior * 0.2 + e, -1, 1) - chirBelief) * 0.25;
+  if (target.chir * chirBelief < -0.04) target.chir = Math.sign(chirBelief);
+  const chir = target.chir;
+  const Zp = Z0.clone().multiplyScalar(chir);
+  rootQuat(target.quat, X, Y, Z0, chir);
+
+  const loc = v => new V3(v.dot(X), v.dot(Y), v.dot(Zp));
+  const bone = (a, b) => loc(P[b].clone().sub(P[a])).normalize();
+  const AX = new V3(1, 0, 0);
+
+  [[5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20]].forEach((ix, i) => {
+    const v1 = bone(ix[0], ix[1]), v2 = bone(ix[1], ix[2]), v3 = bone(ix[2], ix[3]);
+    const t = target.f[i];
+    t.flex = clamp(Math.atan2(v1.z, v1.y), -0.5, 1.75);
+    t.abd = clamp(-Math.asin(clamp(v1.x, -1, 1)), -0.42, 0.42) * (1 - clamp((t.flex - 0.9) / 0.7, 0, 1) * 0.6);
+    t.pip = clamp(signedAngle(v1, v2, AX), -0.15, 2.0);
+    t.dip = clamp(signedAngle(v2, v3, AX), -0.15, 1.6);
+  });
+
+  const t1 = bone(1, 2), t2 = bone(2, 3), t3 = bone(3, 4);
+  const hDef = new V3().crossVectors(t1, THUMB_FLEX_DIR).normalize();
+  const hMeas = new V3().crossVectors(t1, t2).add(new V3().crossVectors(t2, t3));
+  const mag = hMeas.length();
+  let w = clamp((mag - 0.18) / 0.3, 0, 1); if (hMeas.dot(hDef) < 0) w = 0;
+  const h = hDef.clone().lerp(hMeas.normalize(), w); h.addScaledVector(t1, -h.dot(t1)).normalize();
+  thumbQuat(target.tq, t1, h);
+  target.tmcp = clamp(signedAngle(t1, t2, h), -0.35, 1.3);
+  target.tip = clamp(signedAngle(t2, t3, h), -0.35, 1.5);
+
+  const cx = (image[0].x + image[9].x) / 2, cy = (image[0].y + image[9].y) / 2;
+  const d = (a, b) => Math.hypot((image[a].x - image[b].x) * vAspect, image[a].y - image[b].y);
+  const size = Math.max(d(0, 9), d(5, 17) * 1.35);
+  if (follow) {
+    const vh = 2 * CAM_HOME.z * Math.tan(camera.fov * PI / 360), vw = vh * camera.aspect;
+    target.pos.set((0.5 - cx) * vw * 0.78, (0.5 - cy) * vh * 0.78, 0);
+    target.scale = clamp(size / 0.3, 0.6, 1.45);
+  } else { target.pos.set(0, 0, 0); target.scale = 1; }
+}
+
+/* ═════════════════════════ apply (smoothed) ═════════════════════════ */
+function apply(dt, fast) {
+  const k = 1 - Math.exp(-dt * (fast ? 20 : 5)), kp = 1 - Math.exp(-dt * (fast ? 12 : 4));
+  if (cur.chir !== target.chir) { cur.chir = target.chir; cur.quat.copy(target.quat); }
+  cur.quat.slerp(target.quat, k); cur.pos.lerp(target.pos, kp); cur.scale += (target.scale - cur.scale) * kp;
+  cur.tq.slerp(target.tq, k); cur.tmcp += (target.tmcp - cur.tmcp) * k; cur.tip += (target.tip - cur.tip) * k;
+  root.quaternion.copy(cur.quat); root.position.copy(cur.pos); root.scale.set(cur.chir * cur.scale, cur.scale, cur.scale);
+  fingers.forEach((f, i) => {
+    const c = cur.f[i], t = target.f[i];
+    for (const kk of ['flex', 'abd', 'pip', 'dip']) c[kk] += (t[kk] - c[kk]) * k;
+    f.mcp.rotation.set(c.flex, 0, c.abd); f.pip.rotation.x = c.pip; f.dip.rotation.x = c.dip;
+  });
+  thumb.base.quaternion.copy(cur.tq); thumb.mcp.rotation.x = cur.tmcp; thumb.ip.rotation.x = cur.tip;
+  key.target.position.copy(root.position); key.position.copy(root.position).add(KEY_OFF);
+}
+
+/* Gears are driven by the hand, like a real gearbox: wrist flexion turns them, finger/thumb
+   curl pulls the tendons through them. No motion → no rotation. Small gear meshes the big one
+   (opposite direction, faster by the tooth ratio). */
+const _pq = new THREE.Quaternion(), _dq = new THREE.Quaternion();
+let _pf = null, _pc = cur.chir;
+function curlSum() { let f = cur.tmcp + cur.tip; cur.f.forEach(c => { f += c.flex + c.pip + c.dip; }); return f; }
+function driveGears(dt) {
+  const f = curlSum();
+  if (_pf === null || _pc !== cur.chir) { _pq.copy(cur.quat); _pf = f; _pc = cur.chir; return; }
+  _dq.copy(_pq).invert().multiply(cur.quat); if (_dq.w < 0) { _dq.x = -_dq.x; _dq.z = -_dq.z; }
+  const wrist = 2 * _dq.x + 0.6 * 2 * _dq.z;          // flexion + side bend, in radians (local)
+  const T = Math.max(dt, 1e-3);
+  // separate deadbands: idle "breathing" sway (fingers < ~0.9 rad/s, wrist < ~0.05 rad/s)
+  // and tracking jitter must not turn the gears; deliberate motion does
+  const soft = (x, d) => Math.sign(x) * Math.max(0, Math.abs(x) - d);
+  const rate = soft(wrist * 2.2 / T, 0.25) + soft((f - _pf) * 0.9 / T, 1.4);
+  _pq.copy(cur.quat); _pf = f;
+  if (rate === 0) return;
+  const drive = clamp(rate * dt, -0.6, 0.6);
+  GEARS.forEach(g => { g.rotation.z += drive * g.userData.k; });
+}
+
+/* ═════════════════════════ camera + MediaPipe ═════════════════════════ */
+const video = document.getElementById('video'), overlay = document.getElementById('overlay'), octx = overlay.getContext('2d');
+const statusEl = document.getElementById('status'), statusText = document.getElementById('statusText'), btnCam = document.getElementById('btnCam');
+const setStatus = (txt, cls = '') => { statusText.textContent = txt; statusEl.className = 'status ' + cls; };
+let landmarker = null, stream = null, lastSeen = -1e9, lastVideoTime = -1, fake = null;
+
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+const MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+
+async function startCamera() {
+  btnCam.disabled = true;
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('nocam');
+    setStatus('Requesting camera access…');
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 960 }, height: { ideal: 720 }, facingMode: 'user' }, audio: false });
+    video.srcObject = stream; await video.play();
+    document.getElementById('preview').classList.add('on');
+    if (!landmarker) {
+      setStatus('Loading hand-tracking model (a few seconds the first time)…');
+      const { FilesetResolver, HandLandmarker } = await import(MP + '/vision_bundle.mjs');
+      const fileset = await FilesetResolver.forVisionTasks(MP + '/wasm');
+      const make = delegate => HandLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: 'VIDEO', numHands: 1,
+        minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5 });
+      try { landmarker = await make('GPU'); } catch { landmarker = await make('CPU'); }
+    }
+    setStatus('Hold your hand up to the camera', 'warn');
+    btnCam.textContent = 'Stop camera'; btnCam.disabled = false;
+  } catch (err) {
+    console.error(err); stopCamera();
+    const name = err && err.name;
+    const framed = (() => { try { return window.top !== window.self; } catch { return true; } })();
+    setStatus(framed && (name === 'NotAllowedError' || err.message === 'nocam') ? 'Camera is unavailable in this preview · Open the page directly in your browser'
+      : name === 'NotAllowedError' ? 'Camera access denied · Allow it in the address bar and try again'
+      : name === 'NotFoundError' ? 'No camera found'
+      : err.message === 'nocam' ? 'Camera not supported here · Open this file directly in Chrome / Safari / Edge'
+      : 'Failed to start · Check your connection (the tracking model must download) and try again', 'warn');
+  }
+}
+function stopCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; video.srcObject = null;
+  document.getElementById('preview').classList.remove('on');
+  btnCam.textContent = 'Start camera'; btnCam.disabled = false; lastSeen = -1e9;
+  setStatus('Demo mode · Start the camera and the robot hand will follow yours');
+}
+btnCam.onclick = () => stream ? stopCamera() : startCamera();
+
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawOverlay(lm) {
+  const w = overlay.width = video.videoWidth, h = overlay.height = video.videoHeight;
+  octx.clearRect(0, 0, w, h); if (!lm) return;
+  octx.lineWidth = Math.max(2, w / 240); octx.strokeStyle = 'rgba(255,255,255,.85)'; octx.fillStyle = '#fff';
+  octx.beginPath(); for (const [a, b] of BONES) { octx.moveTo(lm[a].x * w, lm[a].y * h); octx.lineTo(lm[b].x * w, lm[b].y * h); } octx.stroke();
+  for (const p of lm) { octx.beginPath(); octx.arc(p.x * w, p.y * h, w / 160, 0, 6.3); octx.fill(); }
+}
+function track(now) {
+  if (fake) { solve(fake.world, fake.image, fake.label, 4 / 3); lastSeen = now; return; }
+  if (!landmarker || !stream || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  let res; try { res = landmarker.detectForVideo(video, now); } catch (e) { console.warn(e); return; }
+  const world = res.worldLandmarks && res.worldLandmarks[0], image = res.landmarks && res.landmarks[0];
+  if (world && image) {
+    const hs = res.handedness || res.handednesses;
+    const hd = hs && hs[0] && hs[0][0] && hs[0][0].categoryName;
+    solve(world, image, hd, video.videoWidth / video.videoHeight);
+    if (now - lastSeen > 500) setStatus('Tracking · The robot hand is mirroring your movements', 'live');
+    lastSeen = now; drawOverlay(image);
+  } else { drawOverlay(null); if (now - lastSeen > 500 && statusEl.classList.contains('live')) setStatus('Hold your hand up to the camera', 'warn'); }
+}
+
+/* ═════════════════════════ UI ═════════════════════════ */
+const btnFollow = document.getElementById('btnFollow');
+btnFollow.onclick = () => { follow = !follow; btnFollow.setAttribute('aria-pressed', follow); };
+document.getElementById('btnFlip').onclick = () => { flipPrior *= -1; chirBelief *= -1; };
+document.getElementById('btnReset').onclick = () => { camera.position.copy(CAM_HOME); controls.target.set(0, 0, 0); controls.update(); };
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h, false); camera.aspect = w / h;
+  camera.fov = w / h < 1 ? 28 + (1 - w / h) * 14 : 28;
+  camera.updateProjectionMatrix();
+  if (composer) { composer.setPixelRatio(renderer.getPixelRatio()); composer.setSize(w, h); }
+}
+window.addEventListener('resize', resize); resize();
+
+/* ═════════════════════════ loop ═════════════════════════ */
+idlePose(0); apply(1, true);
+let prev = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - prev) / 1000); prev = now;
+  track(now);
+  const tracking = now - lastSeen < 450;
+  if (!tracking) idlePose(now / 1000);
+  apply(dt, tracking);
+  driveGears(dt);
+  controls.update();
+  if (composer) composer.render(); else renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+window.__hand = { THREE, scene, camera, controls, renderer, gtao, M, key, target, setFake: v => { fake = v; } };
+</script>
+</body>
+</html>
