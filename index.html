@@ -48,7 +48,8 @@
     .ghost.icon{ display:block; width:38px; height:38px; padding:0; font-size:18px; line-height:1; }
     .tool-items{ display:none; flex-direction:column; align-items:stretch; gap:6px; }
     .tools.open .tool-items{ display:flex; }
-    .tool-items .ghost{ background:rgba(255,255,255,.88); text-align:left; }
+    .tool-items .ghost:not([aria-pressed="true"]){ background:rgba(255,255,255,.88); }
+    .tool-items .ghost{ text-align:left; }
     .dock{ gap:10px; padding:6px 14px 6px 6px; border-radius:26px; bottom:calc(16px + env(safe-area-inset-bottom)); width:calc(100vw - 24px); }
     .primary{ padding:11px 16px; }
     .status{ font-size:12px; line-height:1.35; }
@@ -655,10 +656,10 @@ document.getElementById('btnReset').onclick = () => { camera.position.copy(CAM_H
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
   renderer.setSize(w, h, false); camera.aspect = w / h;
-  // keep ~40 units of the scene visible across the screen: on portrait phones pull the camera back
+  // keep ~34 units of the scene visible across the screen: on portrait phones pull the camera back
   // instead of widening the lens, so the whole hand fits without fish-eye distortion
   camera.fov = 28;
-  const dist = Math.max(52, 40 / (2 * Math.tan(14 * PI / 180) * camera.aspect));
+  const dist = Math.max(52, 34 / (2 * Math.tan(14 * PI / 180) * camera.aspect));
   if (Math.abs(dist - CAM_HOME.z) > 0.01) {
     const d = camera.position.clone().sub(controls.target);
     d.setLength(d.length() * dist / CAM_HOME.z); camera.position.copy(controls.target).add(d);
