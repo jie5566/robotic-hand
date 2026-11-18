@@ -330,7 +330,7 @@ function gear(m, N, th, phase, k) {
   return g;
 }
 /** a meshed pair on the wrist side s: big driver + small driven gear in the same plane (axis = world X) */
-function gearPair(s) {
+function gearPair(s, parent) {
   const m = 0.14, N1 = 16, N2 = 11, rp1 = m * N1 / 2, rp2 = m * N2 / 2, back = 0.015;
   const c1 = new V3(s * 2.15, -1.0, 0.1), d = new V3(0, -0.75, -0.66).normalize();
   const c2 = c1.clone().addScaledVector(d, rp1 + rp2 + back);
@@ -339,8 +339,8 @@ function gearPair(s) {
   const da1 = PI * 2 / N1, da2 = PI * 2 / N2;
   const g1 = gear(m, N1, 0.42, phi1 - 0.41 * da1, 1);             // tooth centred on the line of centres
   const g2 = gear(m, N2, 0.42, phi2 - 0.91 * da2, -N1 / N2);      // gap centred on it → teeth interleave
-  for (const [g, c] of [[g1, c1], [g2, c2]]) { g.rotation.y = PI / 2; g.position.copy(c); hand.add(g); }
-  hand.add(rod(new V3(s * 1.7, c2.y, c2.z), new V3(s * 2.15, c2.y, c2.z), 0.12, M.steel));   // axle of the small gear
+  for (const [g, c] of [[g1, c1], [g2, c2]]) { g.rotation.y = PI / 2; g.position.copy(c); parent.add(g); }
+  parent.add(rod(new V3(s * 1.7, c2.y, c2.z), new V3(s * 2.15, c2.y, c2.z), 0.12, M.steel));   // axle of the small gear
 }
 function segment({ len, w, t, tip = false, plate = true, showHinge = true }) {
   const g = new THREE.Group(), r = t * 0.38;
@@ -406,40 +406,46 @@ const thumb = (() => {
   return { base, mcp, ip };
 })();
 
-// wrist mechanics
+/* The forearm is its own object (`arm`), joined to the hand at the wrist ball.
+   armIn is offset so parts can be placed in the same coordinates as the hand (wrist pivot = hand-local y −0.9). */
+const WRIST_PIVOT = -0.9;
+const arm = new THREE.Group(); scene.add(arm);
+const armIn = new THREE.Group(); armIn.position.y = -WRIST_PIVOT; arm.add(armIn);
+// wrist mechanics: ball, cup and collar move with the hand; gears, rods, tendons and collar ring belong to the forearm
 {
-  hand.add(mesh(new THREE.SphereGeometry(1.6, 48, 32), M.chrome, [0, -0.9, 0]));
+  hand.add(mesh(new THREE.SphereGeometry(1.6, 48, 32), M.chrome, [0, WRIST_PIVOT, 0]));
   const cup = mesh(new THREE.CylinderGeometry(2.6, 2.2, 0.9, 48), M.chrome, [0, 0.25, 0]); cup.scale.z = 0.62; hand.add(cup);
   const coll = mesh(new THREE.TorusGeometry(1.8, 0.2, 14, 56), M.steel, [0, -0.2, 0], [PI / 2, 0, 0]); coll.scale.y = 0.7; hand.add(coll);
   for (const s of [-1, 1]) {
-    gearPair(s);
-    hand.add(rod(new V3(s * 1.5, -3.6, 0.55), new V3(s * 1.75, 0.5, 0.5), 0.13, M.steel));
-    hand.add(rod(new V3(s * 1.5, -3.6, 0.55), new V3(s * 1.62, -1.6, 0.52), 0.26, M.chrome));
-    hand.add(rod(new V3(s * 0.9, -3.6, -0.95), new V3(s * 1.25, 0.5, -0.8), 0.11, M.steel));
+    gearPair(s, armIn);
+    armIn.add(rod(new V3(s * 1.5, -3.6, 0.55), new V3(s * 1.7, -0.6, 0.5), 0.13, M.steel));
+    armIn.add(rod(new V3(s * 1.5, -3.6, 0.55), new V3(s * 1.62, -1.6, 0.52), 0.26, M.chrome));
+    armIn.add(rod(new V3(s * 0.9, -3.6, -0.95), new V3(s * 1.2, -0.6, -0.8), 0.11, M.steel));
   }
   for (const [x, z, k] of [[-2.5, -1.3, 1], [2.4, -1.2, -1], [-0.8, 1.9, 1], [0.9, 1.8, 1], [0.1, -1.9, -1]]) {
-    const c = new THREE.CatmullRomCurve3([new V3(x * 0.8, -4.2, z * 0.6), new V3(x * 1.05, -2.6, z * 0.95), new V3(x * 0.95 + k * 0.2, -1.0, z * 0.9), new V3(x * 0.8, 0.6, z * 0.5)]);
-    hand.add(new THREE.Mesh(new THREE.TubeGeometry(c, 32, 0.14, 10), M.rubber));
+    const c = new THREE.CatmullRomCurve3([new V3(x * 0.8, -4.2, z * 0.6), new V3(x * 1.05, -2.6, z * 0.95), new V3(x * 0.95 + k * 0.2, -1.4, z * 0.9), new V3(x * 0.75, -0.5, z * 0.55)]);
+    armIn.add(new THREE.Mesh(new THREE.TubeGeometry(c, 32, 0.14, 10), M.rubber));
   }
-  const neck = mesh(new THREE.CylinderGeometry(2.55, 2.75, 1.8, 56), M.chrome, [0, -4.3, 0]); neck.scale.z = 0.74; hand.add(neck);
+  const neck = mesh(new THREE.CylinderGeometry(2.55, 2.75, 1.8, 56), M.chrome, [0, -4.3, 0]); neck.scale.z = 0.74; armIn.add(neck);
 }
 
 // forearm (built along +Y, flipped to point down)
 {
-  const fa = new THREE.Group(); fa.position.set(0, -4.2, 0); fa.rotation.z = PI; hand.add(fa);
+  const fa = new THREE.Group(); fa.position.set(0, -4.2, 0); fa.rotation.z = PI; armIn.add(fa);
   const FL = 25;
   fa.add(mesh(pod({ len: FL, w0: 5.5, w1: 7.4, d0: 3.6, d1: 4.6, n: 3.4, c0: 0.9, c1: 2.0 }), M.paint, [0, 0, -0.4]));
   fa.add(mesh(pod({ len: FL - 0.5, w0: 5.0, w1: 6.8, d0: 3.3, d1: 4.3, n: 3, c0: 0.9, c1: 1.8 }), M.pad, [0, 0.25, 0.55]));
   fa.add(mesh(pod({ len: 8.5, w0: 3.1, w1: 3.6, d0: 0.7, n: 6, c0: 0.4, c1: 0.4, ls: 24 }), M.paint, [0.4, 2.6, -2.22]));
   for (let i = 0; i < 3; i++) fa.add(mesh(new RoundedBoxGeometry(0.15, 1.4, 0.12, 2, 0.05), M.dark, [-1.7 + i * 0.36, 4.2, -2.3]));
 }
-root.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+for (const o3 of [root, arm]) o3.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
 
 /* ═════════════════════════ pose state ═════════════════════════ */
 const mkPose = () => ({
   pos: new V3(), scale: 1, chir: -1, quat: new THREE.Quaternion(),
   f: [0, 1, 2, 3].map(() => ({ flex: 0, abd: 0, pip: 0, dip: 0 })),
   tq: new THREE.Quaternion(), tmcp: 0, tip: 0,
+  armFollow: true, armDir: new V3(0, 1, 0),   // armFollow: forearm stays in line with the hand (demo); else armDir = elbow→wrist
 });
 const target = mkPose(), cur = mkPose();
 
@@ -469,7 +475,7 @@ const IDLE = { Y: new V3(0.84, 0.54, 0.0), back: new V3(-0.6, 0.74, 0.25),
 function idlePose(t) {
   const X = new V3().crossVectors(IDLE.Y, IDLE.back);
   const fr = palmFrame(X, IDLE.Y);
-  target.chir = -1; rootQuat(target.quat, fr.X, fr.Y, fr.Z0, -1);
+  target.chir = -1; rootQuat(target.quat, fr.X, fr.Y, fr.Z0, -1); target.armFollow = true;
   const sway = new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.sin(t * 0.5) * 0.03, Math.sin(t * 0.37) * 0.05, Math.sin(t * 0.43) * 0.02));
   target.quat.premultiply(sway);
   target.pos.set(3.5 * Math.min(1, camera.aspect), 2.2 + Math.sin(t * 0.8) * 0.25, 0); target.scale = 1;
@@ -536,6 +542,28 @@ function solve(world, image, label, vAspect) {
 }
 
 /* ═════════════════════════ apply (smoothed) ═════════════════════════ */
+/* Wrist model. The forearm points along armDir (elbow→wrist) and twists with the hand (pronation /
+   supination happens in the forearm, as in a real arm). The wrist then only bends: flexion/extension
+   and side-to-side deviation, clamped to human range. Bending beyond that range is taken up by the forearm. */
+const WRIST = { flexMax: 1.2, extMax: 1.05, dev: 0.45 };
+const _m2 = new THREE.Matrix4(), armQ = new THREE.Quaternion(), _qi = new THREE.Quaternion(), _qx = new THREE.Quaternion();
+const curArmDir = new V3(0, 1, 0);
+function solveArm(R, F, out) {
+  const Yh = new V3(0, 1, 0).applyQuaternion(R), Zh = new V3(0, 0, 1).applyQuaternion(R);
+  const y = F.clone().normalize();
+  let z = Zh.clone().addScaledVector(y, -Zh.dot(y));
+  if (z.lengthSq() < 1e-4) z = new V3(-Yh.x, -Yh.y, -Yh.z).addScaledVector(y, Yh.dot(y));   // palm faces along the arm: use hand dir
+  z.normalize();
+  out.setFromRotationMatrix(_m2.makeBasis(new V3().crossVectors(y, z), y, z));
+  const v = Yh.applyQuaternion(_qi.copy(out).invert());          // hand direction in forearm space
+  const flex = Math.atan2(v.z, v.y), dev = Math.asin(clamp(v.x, -1, 1));
+  const cf = clamp(flex, -WRIST.extMax, WRIST.flexMax), cd = clamp(dev, -WRIST.dev, WRIST.dev);
+  if (cf !== flex || cd !== dev) {
+    const vc = new V3(Math.sin(cd), Math.cos(cd) * Math.cos(cf), Math.cos(cd) * Math.sin(cf));
+    out.multiply(_qx.setFromUnitVectors(vc, v));                 // forearm turns by whatever the wrist can't bend
+  }
+  return out;
+}
 function apply(dt, fast) {
   const k = 1 - Math.exp(-dt * (fast ? 20 : 5)), kp = 1 - Math.exp(-dt * (fast ? 12 : 4));
   if (cur.chir !== target.chir) { cur.chir = target.chir; cur.quat.copy(target.quat); }
@@ -548,26 +576,34 @@ function apply(dt, fast) {
     f.mcp.rotation.set(c.flex, 0, c.abd); f.pip.rotation.x = c.pip; f.dip.rotation.x = c.dip;
   });
   thumb.base.quaternion.copy(cur.tq); thumb.mcp.rotation.x = cur.tmcp; thumb.ip.rotation.x = cur.tip;
+  // forearm
+  const desired = target.armFollow ? new V3(0, 1, 0).applyQuaternion(cur.quat) : target.armDir;
+  curArmDir.lerp(desired, 1 - Math.exp(-dt * (fast ? 10 : 5))).normalize();
+  solveArm(cur.quat, curArmDir, armQ);
+  arm.quaternion.copy(armQ);
+  arm.position.copy(root.position).add(new V3(0, (hand.position.y + WRIST_PIVOT) * cur.scale, 0).applyQuaternion(cur.quat));
+  arm.scale.copy(root.scale);
   key.target.position.copy(root.position); key.position.copy(root.position).add(KEY_OFF);
 }
 
 /* Gears are driven by the hand, like a real gearbox: wrist flexion turns them, finger/thumb
    curl pulls the tendons through them. No motion → no rotation. Small gear meshes the big one
    (opposite direction, faster by the tooth ratio). */
-const _pq = new THREE.Quaternion(), _dq = new THREE.Quaternion();
+const _pq = new THREE.Quaternion(), _dq = new THREE.Quaternion(), _qw = new THREE.Quaternion();
 let _pf = null, _pc = cur.chir;
 function curlSum() { let f = cur.tmcp + cur.tip; cur.f.forEach(c => { f += c.flex + c.pip + c.dip; }); return f; }
 function driveGears(dt) {
   const f = curlSum();
-  if (_pf === null || _pc !== cur.chir) { _pq.copy(cur.quat); _pf = f; _pc = cur.chir; return; }
-  _dq.copy(_pq).invert().multiply(cur.quat); if (_dq.w < 0) { _dq.x = -_dq.x; _dq.z = -_dq.z; }
+  const W = _qw.copy(armQ).invert().multiply(cur.quat);          // wrist = hand relative to forearm
+  if (_pf === null || _pc !== cur.chir) { _pq.copy(W); _pf = f; _pc = cur.chir; return; }
+  _dq.copy(_pq).invert().multiply(W); if (_dq.w < 0) { _dq.x = -_dq.x; _dq.z = -_dq.z; }
   const wrist = 2 * _dq.x + 0.6 * 2 * _dq.z;          // flexion + side bend, in radians (local)
   const T = Math.max(dt, 1e-3);
   // separate deadbands: idle "breathing" sway (fingers < ~0.9 rad/s, wrist < ~0.05 rad/s)
   // and tracking jitter must not turn the gears; deliberate motion does
   const soft = (x, d) => Math.sign(x) * Math.max(0, Math.abs(x) - d);
   const rate = soft(wrist * 2.2 / T, 0.25) + soft((f - _pf) * 0.9 / T, 1.4);
-  _pq.copy(cur.quat); _pf = f;
+  _pq.copy(W); _pf = f;
   if (rate === 0) return;
   const drive = clamp(rate * dt, -0.6, 0.6);
   GEARS.forEach(g => { g.rotation.z += drive * g.userData.k; });
@@ -577,10 +613,36 @@ function driveGears(dt) {
 const video = document.getElementById('video'), overlay = document.getElementById('overlay'), octx = overlay.getContext('2d');
 const statusEl = document.getElementById('status'), statusText = document.getElementById('statusText'), btnCam = document.getElementById('btnCam');
 const setStatus = (txt, cls = '') => { statusText.textContent = txt; statusEl.className = 'status ' + cls; };
-let landmarker = null, stream = null, lastSeen = -1e9, lastVideoTime = -1, fake = null;
+let landmarker = null, poseLm = null, poseLoading = false, stream = null, lastSeen = -1e9, lastVideoTime = -1, fake = null;
 
 const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
 const MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const POSE_MODEL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+// when the elbow isn't visible, assume the forearm rises from below the frame, tilted slightly away from the camera
+const DEFAULT_ARM = new V3(0, 1, -0.25).normalize();
+let poseDir = null, poseSeen = -1e9, poseFrame = 0;
+async function loadPose(vision, fileset) {
+  if (poseLm || poseLoading) return; poseLoading = true;
+  const make = delegate => vision.PoseLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: POSE_MODEL, delegate }, runningMode: 'VIDEO', numPoses: 1,
+    minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5 });
+  try { poseLm = await make('GPU'); } catch { try { poseLm = await make('CPU'); } catch (e) { console.warn('pose tracking unavailable', e); } }
+  poseLoading = false;
+}
+/* elbow→wrist from body pose, for the arm the tracked hand belongs to; runs every 2nd frame (4th on phones) */
+function trackArm(now, handImg) {
+  if (!poseLm || quality >= 2 || (poseFrame++ % (IS_MOBILE ? 4 : 2))) return;
+  let pr; try { pr = poseLm.detectForVideo(video, now); } catch { return; }
+  const pl = pr.landmarks && pr.landmarks[0], pw = pr.worldLandmarks && pr.worldLandmarks[0];
+  if (!pl || !pw) return;
+  const dl = Math.hypot(pl[15].x - handImg[0].x, pl[15].y - handImg[0].y), dr = Math.hypot(pl[16].x - handImg[0].x, pl[16].y - handImg[0].y);
+  const [e, w] = dl < dr ? [13, 15] : [14, 16];
+  const el = pl[e], vis = el.visibility == null ? 1 : el.visibility;
+  if (Math.min(dl, dr) > 0.12 || vis < 0.65 || el.x < 0.01 || el.x > 0.99 || el.y > 0.99) return;   // elbow out of frame / wrong arm
+  const d = new V3(-(pw[w].x - pw[e].x), -(pw[w].y - pw[e].y), -(pw[w].z - pw[e].z) * 0.6);   // mirrored like the hand; depth is noisy
+  if (d.lengthSq() < 1e-6) return;
+  poseDir = d.normalize(); poseSeen = now;
+}
 
 async function startCamera() {
   btnCam.disabled = true;
@@ -592,12 +654,14 @@ async function startCamera() {
     document.getElementById('preview').classList.add('on');
     if (!landmarker) {
       setStatus('Loading hand-tracking model (a few seconds the first time)…');
-      const { FilesetResolver, HandLandmarker } = await import(MP + '/vision_bundle.mjs');
+      const vision = await import(MP + '/vision_bundle.mjs');
+      const { FilesetResolver, HandLandmarker } = vision;
       const fileset = await FilesetResolver.forVisionTasks(MP + '/wasm');
       const make = delegate => HandLandmarker.createFromOptions(fileset, {
         baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: 'VIDEO', numHands: 1,
         minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5 });
       try { landmarker = await make('GPU'); } catch { landmarker = await make('CPU'); }
+      loadPose(vision, fileset);   // in the background: hand tracking starts right away, the forearm sharpens once it's ready
     }
     setStatus('Hold your hand up to the camera', 'warn');
     btnCam.textContent = 'Stop camera'; btnCam.disabled = false;
@@ -630,7 +694,7 @@ function drawOverlay(lm) {
   for (const p of lm) { octx.beginPath(); octx.arc(p.x * w, p.y * h, w / 160, 0, 6.3); octx.fill(); }
 }
 function track(now) {
-  if (fake) { solve(fake.world, fake.image, fake.label, 4 / 3); lastSeen = now; return; }
+  if (fake) { solve(fake.world, fake.image, fake.label, 4 / 3); target.armFollow = false; target.armDir.copy(fake.armDir || DEFAULT_ARM); lastSeen = now; return; }
   if (!landmarker || !stream || video.readyState < 2 || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
   let res; try { res = landmarker.detectForVideo(video, now); } catch (e) { console.warn(e); return; }
@@ -639,6 +703,9 @@ function track(now) {
     const hs = res.handedness || res.handednesses;
     const hd = hs && hs[0] && hs[0][0] && hs[0][0].categoryName;
     solve(world, image, hd, video.videoWidth / video.videoHeight);
+    trackArm(now, image);
+    target.armFollow = false;
+    target.armDir.copy(poseDir && now - poseSeen < 600 ? poseDir : DEFAULT_ARM);
     if (now - lastSeen > 500) setStatus('Tracking · The robot hand is mirroring your movements', 'live');
     lastSeen = now; drawOverlay(image);
   } else { drawOverlay(null); if (now - lastSeen > 500 && statusEl.classList.contains('live')) setStatus('Hold your hand up to the camera', 'warn'); }
@@ -707,7 +774,7 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-window.__hand = { THREE, scene, camera, controls, renderer, M, key, target, setFake: v => { fake = v; }, get quality() { return quality; }, get post() { return !!composer; } };
+window.__hand = { THREE, scene, camera, controls, renderer, M, key, target, setFake: v => { fake = v; }, get quality() { return quality; }, arm, armQ, cur, GEARS, get post() { return !!composer; } };
 </script>
 </body>
 </html>
