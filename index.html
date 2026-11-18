@@ -352,9 +352,9 @@ function segment({ len, w, t, tip = false, plate = true, showHinge = true }) {
     g.add(mesh(pod({ len: L * 0.94, w0: w * 0.87, w1: w * 0.83, d0: t * 0.62, d1: t * 0.6, n: 3, c0: t * 0.2, c1: t * 0.2 }), M.pad, [0, y0 + L * 0.03, t * 0.17]));
     if (plate) g.add(mesh(pod({ len: L * 0.5, w0: w * 0.6, w1: w * 0.5, d0: t * 0.2, n: 5, c0: t * 0.1, c1: t * 0.1, ls: 20 }), M.paint, [0, y0 + L * 0.36, -t * 0.53]));
   } else {
-    const bend = u => t * 0.1 * u * u;
+    const bend = u => t * 0.035 * u * u;
     g.add(mesh(pod({ len: L * 0.74, w0: w, w1: w * 0.84, d0: t * 0.8, d1: t * 0.6, n: 3.4, c0: t * 0.22, c1: t * 0.45, zc: bend }), M.paint, [0, y0, -t * 0.14]));
-    g.add(mesh(pod({ len: L, w0: w * 0.9, w1: w * 0.76, d0: t * 0.66, d1: t * 0.56, n: 2.6, c0: t * 0.3, c1: t * 0.55, zc: u => t * 0.14 * u * u }), M.pad, [0, y0, t * 0.13]));
+    g.add(mesh(pod({ len: L, w0: w * 0.9, w1: w * 0.76, d0: t * 0.66, d1: t * 0.56, n: 2.6, c0: t * 0.3, c1: t * 0.55, zc: u => t * 0.05 * u * u }), M.pad, [0, y0, t * 0.13]));
     g.add(mesh(pod({ len: L * 0.3, w0: w * 0.55, w1: w * 0.45, d0: t * 0.14, n: 4, c0: t * 0.08, c1: t * 0.12, ls: 16 }), M.pad, [0, y0 + L * 0.66, -t * 0.43], [-0.25, 0, 0]));
   }
   return g;
@@ -489,6 +489,13 @@ function idlePose(t) {
 /* ═════════════════════════ landmarks → pose ═════════════════════════ */
 let flipPrior = 1, chirBelief = -1, follow = true;
 const signedAngle = (a, b, axis) => Math.atan2(new V3().crossVectors(a, b).dot(axis), a.dot(b));
+/* Tracking reads a fully straight finger as slightly bent (≈ 8–20°). Soft dead-zone: small bends fade to 0
+   smoothly (no snapping), larger bends pass through, rescaled so a full fist still reaches the full angle. */
+function straighten(a, b, max) {
+  if (a <= 0) return a;
+  const r = a < 2 * b ? a * a / (4 * b) : a - b;
+  return r * max / (max - b);
+}
 
 function solve(world, image, label, vAspect) {
   // mirror like a mirror: scene = −(mediapipe world) → x flipped, y up, z toward viewer
@@ -515,10 +522,14 @@ function solve(world, image, label, vAspect) {
   [[5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20]].forEach((ix, i) => {
     const v1 = bone(ix[0], ix[1]), v2 = bone(ix[1], ix[2]), v3 = bone(ix[2], ix[3]);
     const t = target.f[i];
-    t.flex = clamp(Math.atan2(v1.z, v1.y), -0.5, 1.75);
+    t.flex = clamp(straighten(Math.atan2(v1.z, v1.y), 0.06, 1.75), -0.5, 1.75);
     t.abd = clamp(-Math.asin(clamp(v1.x, -1, 1)), -0.42, 0.42) * (1 - clamp((t.flex - 0.9) / 0.7, 0, 1) * 0.6);
-    t.pip = clamp(signedAngle(v1, v2, AX), -0.15, 2.0);
-    t.dip = clamp(signedAngle(v2, v3, AX), -0.15, 1.6);
+    const pip = straighten(signedAngle(v1, v2, AX), 0.14, 2.0);
+    const dip = straighten(signedAngle(v2, v3, AX), 0.18, 1.6);
+    t.pip = clamp(pip, -0.1, 2.0);
+    // fingertip landmarks are the least reliable; in a real finger the tip joint follows the middle one (≈ 2/3),
+    // so blend the measurement with that coupling to keep the tip responsive and consistent
+    t.dip = clamp(dip * 0.55 + pip * 0.67 * 0.45, -0.1, 1.6);
   });
 
   const t1 = bone(1, 2), t2 = bone(2, 3), t3 = bone(3, 4);
@@ -565,7 +576,7 @@ function solveArm(R, F, out) {
   return out;
 }
 function apply(dt, fast) {
-  const k = 1 - Math.exp(-dt * (fast ? 20 : 5)), kp = 1 - Math.exp(-dt * (fast ? 12 : 4));
+  const k = 1 - Math.exp(-dt * (fast ? 26 : 5)), kp = 1 - Math.exp(-dt * (fast ? 12 : 4));
   if (cur.chir !== target.chir) { cur.chir = target.chir; cur.quat.copy(target.quat); }
   cur.quat.slerp(target.quat, k); cur.pos.lerp(target.pos, kp); cur.scale += (target.scale - cur.scale) * kp;
   cur.tq.slerp(target.tq, k); cur.tmcp += (target.tmcp - cur.tmcp) * k; cur.tip += (target.tip - cur.tip) * k;
