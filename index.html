@@ -576,7 +576,7 @@ function solveArm(R, F, out) {
   return out;
 }
 function apply(dt, fast) {
-  const k = 1 - Math.exp(-dt * (fast ? 26 : 5)), kp = 1 - Math.exp(-dt * (fast ? 12 : 4));
+  const k = 1 - Math.exp(-dt * (fast ? 30 : 5)), kp = 1 - Math.exp(-dt * (fast ? 12 : 4));
   if (cur.chir !== target.chir) { cur.chir = target.chir; cur.quat.copy(target.quat); }
   cur.quat.slerp(target.quat, k); cur.pos.lerp(target.pos, kp); cur.scale += (target.scale - cur.scale) * kp;
   cur.tq.slerp(target.tq, k); cur.tmcp += (target.tmcp - cur.tmcp) * k; cur.tip += (target.tip - cur.tip) * k;
@@ -704,8 +704,36 @@ function drawOverlay(lm) {
   octx.beginPath(); for (const [a, b] of BONES) { octx.moveTo(lm[a].x * w, lm[a].y * h); octx.lineTo(lm[b].x * w, lm[b].y * h); } octx.stroke();
   for (const p of lm) { octx.beginPath(); octx.arc(p.x * w, p.y * h, w / 160, 0, 6.3); octx.fill(); }
 }
+/* One Euro filter (Casiez et al.): adaptive low-pass. When a point is still or moving slowly it filters
+   hard (kills camera jitter); when it moves fast the cutoff rises, so real motion isn't delayed. */
+const oeAlpha = (dt, cut) => 1 / (1 + 1 / (2 * PI * cut * dt));
+class OneEuro {
+  constructor(minCut, beta, dCut = 1.0) { this.minCut = minCut; this.beta = beta; this.dCut = dCut; this.x = null; }
+  reset() { this.x = null; }
+  filter(x, t) {
+    if (this.x === null) { this.x = x; this.dx = 0; this.t = t; return x; }
+    const dt = Math.max(1e-3, t - this.t); this.t = t;
+    this.dx += oeAlpha(dt, this.dCut) * ((x - this.x) / dt - this.dx);
+    this.x += oeAlpha(dt, this.minCut + this.beta * Math.abs(this.dx)) * (x - this.x);
+    return this.x;
+  }
+}
+// world landmarks are metres around the hand centre: jitter ≈ 2–4 mm, finger motion ≈ 0.1–1 m/s
+const worldF = Array.from({ length: 63 }, () => new OneEuro(0.5, 40, 0.5));
+// image landmarks are 0–1 screen units (used for on-screen position and size)
+const imageF = Array.from({ length: 42 }, () => new OneEuro(0.5, 25, 0.5));
+let useFilter = true, lastFiltered = -1e9;
+function smoothLandmarks(world, image, now) {
+  if (!useFilter) return [world, image];
+  const t = now / 1000;
+  if (now - lastFiltered > 300) { worldF.forEach(f => f.reset()); imageF.forEach(f => f.reset()); }   // hand re-acquired: start fresh
+  lastFiltered = now;
+  const w = world.map((p, i) => ({ x: worldF[i * 3].filter(p.x, t), y: worldF[i * 3 + 1].filter(p.y, t), z: worldF[i * 3 + 2].filter(p.z, t) }));
+  const im = image.map((p, i) => ({ x: imageF[i * 2].filter(p.x, t), y: imageF[i * 2 + 1].filter(p.y, t) }));
+  return [w, im];
+}
 function track(now) {
-  if (fake) { solve(fake.world, fake.image, fake.label, 4 / 3); target.armFollow = false; target.armDir.copy(fake.armDir || DEFAULT_ARM); lastSeen = now; return; }
+  if (fake) { const [fw, fi] = smoothLandmarks(fake.world, fake.image, now); solve(fw, fi, fake.label, 4 / 3); target.armFollow = false; target.armDir.copy(fake.armDir || DEFAULT_ARM); lastSeen = now; return; }
   if (!landmarker || !stream || video.readyState < 2 || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
   let res; try { res = landmarker.detectForVideo(video, now); } catch (e) { console.warn(e); return; }
@@ -713,7 +741,8 @@ function track(now) {
   if (world && image) {
     const hs = res.handedness || res.handednesses;
     const hd = hs && hs[0] && hs[0][0] && hs[0][0].categoryName;
-    solve(world, image, hd, video.videoWidth / video.videoHeight);
+    const [sw, si] = smoothLandmarks(world, image, now);
+    solve(sw, si, hd, video.videoWidth / video.videoHeight);
     trackArm(now, image);
     target.armFollow = false;
     target.armDir.copy(poseDir && now - poseSeen < 600 ? poseDir : DEFAULT_ARM);
@@ -785,7 +814,7 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-window.__hand = { THREE, scene, camera, controls, renderer, M, key, target, setFake: v => { fake = v; }, get quality() { return quality; }, arm, armQ, cur, GEARS, get post() { return !!composer; } };
+window.__hand = { THREE, scene, camera, controls, renderer, M, key, target, setFake: v => { fake = v; }, get quality() { return quality; }, setFilter: v => { useFilter = v; }, arm, armQ, cur, GEARS, get post() { return !!composer; } };
 </script>
 </body>
 </html>
