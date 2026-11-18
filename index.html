@@ -497,7 +497,69 @@ function straighten(a, b, max) {
   return r * max / (max - b);
 }
 
-function solve(world, image, label, vAspect) {
+/* One Euro filter (Casiez et al.): adaptive low-pass. When a point is still or moving slowly it filters
+   hard (kills camera jitter); when it moves fast the cutoff rises, so real motion isn't delayed. */
+const oeAlpha = (dt, cut) => 1 / (1 + 1 / (2 * PI * cut * dt));
+class OneEuro {
+  constructor(minCut, beta, dCut = 1.0) { this.minCut = minCut; this.beta = beta; this.dCut = dCut; this.x = null; }
+  reset() { this.x = null; }
+  filter(x, t) {
+    if (this.x === null) { this.x = x; this.dx = 0; this.t = t; return x; }
+    const dt = Math.max(1e-3, t - this.t); this.t = t;
+    this.dx += oeAlpha(dt, this.dCut) * ((x - this.x) / dt - this.dx);
+    this.x += oeAlpha(dt, this.minCut + this.beta * Math.abs(this.dx)) * (x - this.x);
+    return this.x;
+  }
+}
+/* Pose stabiliser. Filters what you actually see — each joint angle, the palm and thumb orientation, and the
+   on-screen position — instead of the raw tracking points. The speed that loosens the filter is the joint's own
+   smoothed angular speed, which camera noise (a few degrees back and forth) barely raises, while a real
+   movement (hundreds of degrees per second) does. A tiny dead-band (≈1°) then holds a joint perfectly still
+   when only noise is left. */
+const A_ = (dt, cut) => 1 / (1 + 1 / (2 * PI * cut * dt));
+class QuatEuro {
+  constructor(minCut, beta, dCut = 1.0) { this.minCut = minCut; this.beta = beta; this.dCut = dCut; this.q = null; }
+  reset() { this.q = null; }
+  filter(q, t) {
+    if (!this.q) { this.q = q.clone(); this.v = 0; this.t = t; return this.q; }
+    const dt = Math.max(1e-3, t - this.t); this.t = t;
+    this.v += A_(dt, this.dCut) * (this.q.angleTo(q) / dt - this.v);
+    this.q.slerp(q, A_(dt, this.minCut + this.beta * this.v));
+    return this.q;
+  }
+}
+const JOINT = () => new OneEuro(0.6, 0.5, 1.0);          // radians: noise ≈ 3–5°, real motion 100–600°/s
+const STAB = {
+  f: [0, 1, 2, 3].map(() => ({ flex: JOINT(), abd: JOINT(), pip: JOINT(), dip: JOINT() })),
+  tmcp: JOINT(), tip: JOINT(),
+  root: new QuatEuro(0.6, 0.5), thumb: new QuatEuro(0.6, 0.5),
+  px: new OneEuro(0.6, 0.25), py: new OneEuro(0.6, 0.25), sc: new OneEuro(0.5, 2.0),   // scene units / scale
+  held: new Map(), last: -1e9, chir: 0,
+};
+let useFilter = true;
+function hold(key, v, db = 0.02) {                     // dead-band: ignore changes smaller than ~1.1°
+  let h = STAB.held.get(key); if (h === undefined) h = v;
+  const d = v - h; if (Math.abs(d) > db) h += d - Math.sign(d) * db;
+  STAB.held.set(key, h); return h;
+}
+function stabilize(now) {
+  if (!useFilter) return;
+  const t = now / 1000;
+  if (now - STAB.last > 300 || STAB.chir !== target.chir) {   // hand re-acquired or mirrored: start fresh
+    for (const f of STAB.f) for (const k in f) f[k].x = null;
+    for (const k of ['tmcp', 'tip', 'px', 'py', 'sc']) STAB[k].x = null;
+    STAB.root.reset(); STAB.thumb.reset(); STAB.held.clear(); STAB.chir = target.chir;
+  }
+  STAB.last = now;
+  target.f.forEach((j, i) => { for (const k of ['flex', 'abd', 'pip', 'dip']) j[k] = hold(i + k, STAB.f[i][k].filter(j[k], t)); });
+  target.tmcp = hold('tmcp', STAB.tmcp.filter(target.tmcp, t));
+  target.tip = hold('tip', STAB.tip.filter(target.tip, t));
+  target.quat.copy(STAB.root.filter(target.quat, t));
+  target.tq.copy(STAB.thumb.filter(target.tq, t));
+  target.pos.x = STAB.px.filter(target.pos.x, t); target.pos.y = STAB.py.filter(target.pos.y, t);
+  target.scale = STAB.sc.filter(target.scale, t);
+}
+function solve(world, image, label, vAspect, now) {
   // mirror like a mirror: scene = −(mediapipe world) → x flipped, y up, z toward viewer
   const P = world.map(p => new V3(-p.x, -p.y, -p.z));
   const fr = palmFrame(P[5].clone().sub(P[17]), P[9].clone().sub(P[0]));
@@ -550,6 +612,7 @@ function solve(world, image, label, vAspect) {
     target.pos.set((0.5 - cx) * vw * 0.78, (0.5 - cy) * vh * 0.78, 0);
     target.scale = clamp(size / 0.3, 0.6, 1.45);
   } else { target.pos.set(0, 0, 0); target.scale = 1; }
+  stabilize(now);
 }
 
 /* ═════════════════════════ apply (smoothed) ═════════════════════════ */
@@ -576,7 +639,7 @@ function solveArm(R, F, out) {
   return out;
 }
 function apply(dt, fast) {
-  const k = 1 - Math.exp(-dt * (fast ? 30 : 5)), kp = 1 - Math.exp(-dt * (fast ? 12 : 4));
+  const k = 1 - Math.exp(-dt * (fast ? 20 : 5)), kp = 1 - Math.exp(-dt * (fast ? 12 : 4));
   if (cur.chir !== target.chir) { cur.chir = target.chir; cur.quat.copy(target.quat); }
   cur.quat.slerp(target.quat, k); cur.pos.lerp(target.pos, kp); cur.scale += (target.scale - cur.scale) * kp;
   cur.tq.slerp(target.tq, k); cur.tmcp += (target.tmcp - cur.tmcp) * k; cur.tip += (target.tip - cur.tip) * k;
@@ -704,36 +767,8 @@ function drawOverlay(lm) {
   octx.beginPath(); for (const [a, b] of BONES) { octx.moveTo(lm[a].x * w, lm[a].y * h); octx.lineTo(lm[b].x * w, lm[b].y * h); } octx.stroke();
   for (const p of lm) { octx.beginPath(); octx.arc(p.x * w, p.y * h, w / 160, 0, 6.3); octx.fill(); }
 }
-/* One Euro filter (Casiez et al.): adaptive low-pass. When a point is still or moving slowly it filters
-   hard (kills camera jitter); when it moves fast the cutoff rises, so real motion isn't delayed. */
-const oeAlpha = (dt, cut) => 1 / (1 + 1 / (2 * PI * cut * dt));
-class OneEuro {
-  constructor(minCut, beta, dCut = 1.0) { this.minCut = minCut; this.beta = beta; this.dCut = dCut; this.x = null; }
-  reset() { this.x = null; }
-  filter(x, t) {
-    if (this.x === null) { this.x = x; this.dx = 0; this.t = t; return x; }
-    const dt = Math.max(1e-3, t - this.t); this.t = t;
-    this.dx += oeAlpha(dt, this.dCut) * ((x - this.x) / dt - this.dx);
-    this.x += oeAlpha(dt, this.minCut + this.beta * Math.abs(this.dx)) * (x - this.x);
-    return this.x;
-  }
-}
-// world landmarks are metres around the hand centre: jitter ≈ 2–4 mm, finger motion ≈ 0.1–1 m/s
-const worldF = Array.from({ length: 63 }, () => new OneEuro(0.5, 40, 0.5));
-// image landmarks are 0–1 screen units (used for on-screen position and size)
-const imageF = Array.from({ length: 42 }, () => new OneEuro(0.5, 25, 0.5));
-let useFilter = true, lastFiltered = -1e9;
-function smoothLandmarks(world, image, now) {
-  if (!useFilter) return [world, image];
-  const t = now / 1000;
-  if (now - lastFiltered > 300) { worldF.forEach(f => f.reset()); imageF.forEach(f => f.reset()); }   // hand re-acquired: start fresh
-  lastFiltered = now;
-  const w = world.map((p, i) => ({ x: worldF[i * 3].filter(p.x, t), y: worldF[i * 3 + 1].filter(p.y, t), z: worldF[i * 3 + 2].filter(p.z, t) }));
-  const im = image.map((p, i) => ({ x: imageF[i * 2].filter(p.x, t), y: imageF[i * 2 + 1].filter(p.y, t) }));
-  return [w, im];
-}
 function track(now) {
-  if (fake) { const [fw, fi] = smoothLandmarks(fake.world, fake.image, now); solve(fw, fi, fake.label, 4 / 3); target.armFollow = false; target.armDir.copy(fake.armDir || DEFAULT_ARM); lastSeen = now; return; }
+  if (fake) { solve(fake.world, fake.image, fake.label, 4 / 3, now); target.armFollow = false; target.armDir.copy(fake.armDir || DEFAULT_ARM); lastSeen = now; return; }
   if (!landmarker || !stream || video.readyState < 2 || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
   let res; try { res = landmarker.detectForVideo(video, now); } catch (e) { console.warn(e); return; }
@@ -741,8 +776,7 @@ function track(now) {
   if (world && image) {
     const hs = res.handedness || res.handednesses;
     const hd = hs && hs[0] && hs[0][0] && hs[0][0].categoryName;
-    const [sw, si] = smoothLandmarks(world, image, now);
-    solve(sw, si, hd, video.videoWidth / video.videoHeight);
+    solve(world, image, hd, video.videoWidth / video.videoHeight, now);
     trackArm(now, image);
     target.armFollow = false;
     target.armDir.copy(poseDir && now - poseSeen < 600 ? poseDir : DEFAULT_ARM);
@@ -814,7 +848,7 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-window.__hand = { THREE, scene, camera, controls, renderer, M, key, target, setFake: v => { fake = v; }, get quality() { return quality; }, setFilter: v => { useFilter = v; }, arm, armQ, cur, GEARS, get post() { return !!composer; } };
+window.__hand = { THREE, scene, camera, controls, renderer, M, key, target, setFake: v => { fake = v; }, get quality() { return quality; }, setFilter: v => { useFilter = v; }, solve, arm, armQ, cur, GEARS, get post() { return !!composer; } };
 </script>
 </body>
 </html>
