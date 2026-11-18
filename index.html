@@ -532,7 +532,8 @@ const JOINT = () => new OneEuro(0.6, 0.5, 1.0);          // radians: noise ≈ 3
 const STAB = {
   f: [0, 1, 2, 3].map(() => ({ flex: JOINT(), abd: JOINT(), pip: JOINT(), dip: JOINT() })),
   tmcp: JOINT(), tip: JOINT(),
-  root: new QuatEuro(0.6, 0.5), thumb: new QuatEuro(0.6, 0.5),
+  root: new QuatEuro(0.4, 0.6), thumb: new QuatEuro(0.6, 0.5),
+  rootHeld: new THREE.Quaternion(), rootHas: false,
   px: new OneEuro(0.6, 0.25), py: new OneEuro(0.6, 0.25), sc: new OneEuro(0.5, 2.0),   // scene units / scale
   held: new Map(), last: -1e9, chir: 0,
 };
@@ -548,13 +549,18 @@ function stabilize(now) {
   if (now - STAB.last > 300 || STAB.chir !== target.chir) {   // hand re-acquired or mirrored: start fresh
     for (const f of STAB.f) for (const k in f) f[k].x = null;
     for (const k of ['tmcp', 'tip', 'px', 'py', 'sc']) STAB[k].x = null;
-    STAB.root.reset(); STAB.thumb.reset(); STAB.held.clear(); STAB.chir = target.chir;
+    STAB.root.reset(); STAB.thumb.reset(); STAB.held.clear(); STAB.rootHas = false; STAB.chir = target.chir;
   }
   STAB.last = now;
   target.f.forEach((j, i) => { for (const k of ['flex', 'abd', 'pip', 'dip']) j[k] = hold(i + k, STAB.f[i][k].filter(j[k], t)); });
   target.tmcp = hold('tmcp', STAB.tmcp.filter(target.tmcp, t));
   target.tip = hold('tip', STAB.tip.filter(target.tip, t));
-  target.quat.copy(STAB.root.filter(target.quat, t));
+  // palm dead-band: orientation changes under ~1.4° are camera noise — hold the palm still
+  const rq = STAB.root.filter(target.quat, t);
+  if (!STAB.rootHas) { STAB.rootHeld.copy(rq); STAB.rootHas = true; }
+  const ra = STAB.rootHeld.angleTo(rq), RDB = 0.025;
+  if (ra > RDB) STAB.rootHeld.slerp(rq, (ra - RDB) / ra);
+  target.quat.copy(STAB.rootHeld);
   target.tq.copy(STAB.thumb.filter(target.tq, t));
   target.pos.x = STAB.px.filter(target.pos.x, t); target.pos.y = STAB.py.filter(target.pos.y, t);
   target.scale = STAB.sc.filter(target.scale, t);
@@ -562,7 +568,11 @@ function stabilize(now) {
 function solve(world, image, label, vAspect, now) {
   // mirror like a mirror: scene = −(mediapipe world) → x flipped, y up, z toward viewer
   const P = world.map(p => new V3(-p.x, -p.y, -p.z));
-  const fr = palmFrame(P[5].clone().sub(P[17]), P[9].clone().sub(P[0]));
+  // palm orientation from all five palm points (wrist + four knuckles) instead of three, so one noisy point
+  // can't tilt the whole hand: across = index→pinky knuckles plus middle→ring; up = wrist → knuckle centre
+  const across = P[5].clone().sub(P[17]).add(P[9].clone().sub(P[13]));
+  const up = P[5].clone().add(P[9]).add(P[13]).add(P[17]).multiplyScalar(0.25).sub(P[0]);
+  const fr = palmFrame(across, up);
   const X = fr.X.clone(), Y = fr.Y.clone(), Z0 = fr.Z0.clone();
 
   // chirality: fingers can only curl toward the palm; fall back on the model's label for a flat hand
